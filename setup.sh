@@ -1,23 +1,52 @@
 #!/usr/bin/env bash
-# vLLM Baseline Setup — Qwen3-32B on 2× L20 (PNV5b.16XLARGE192)
+# Instance Setup — Qwen3-32B on L20 GPUs
 # Run on a fresh Tencent Cloud Ubuntu 22.04 instance.
+#
+# Usage:
+#   bash setup.sh --vllm                        # setup for vLLM
+#   bash setup.sh --tacox                       # setup for TACO-X (requires TACO_X_IMAGE)
 set -euo pipefail
 
 MODEL="Qwen/Qwen3-32B"
 
+# ── Parse flags ──────────────────────────────────────────────────
+ENGINE=""
+case "${1:-}" in
+    --vllm)  ENGINE="vllm" ;;
+    --tacox) ENGINE="tacox" ;;
+    *)
+        echo "Usage: bash setup.sh --vllm | --tacox"
+        echo ""
+        echo "  --vllm    Install vLLM serving engine"
+        echo "  --tacox   Install Docker + TACO-X container"
+        exit 1
+        ;;
+esac
+
+if [ "$ENGINE" = "tacox" ] && [ -z "${TACO_X_IMAGE:-}" ]; then
+    echo "ERROR: TACO_X_IMAGE is not set."
+    echo "  Contact your Tencent Cloud representative for the image URL, then:"
+    echo "  export TACO_X_IMAGE=\"ccr.ccs.tencentyun.com/taco/taco_x_prod:<tag>\""
+    echo "  bash setup.sh --tacox"
+    exit 1
+fi
+
 echo "============================================"
-echo "  vLLM Baseline — Instance Setup"
-echo "  Model: ${MODEL}"
-echo "  Expected: 2× NVIDIA L20 48GB"
+echo "  Instance Setup"
+echo "  Model:  ${MODEL}"
+echo "  Engine: ${ENGINE}"
 echo "============================================"
 echo ""
 echo "  Full run typically takes 25–45 min"
-echo "  (vLLM install + ~65 GB model download)."
+echo "  (dependencies + ~65 GB model download)."
 echo ""
 
-# ── [1/7] Mount data disk ─────────────────────────────────────────
+STEP=0
+
+# ── Mount data disk ──────────────────────────────────────────────
+STEP=$((STEP + 1))
 if lsblk | grep -q vdb; then
-    echo "[1/7] Mounting data disk..."
+    echo "[${STEP}] Mounting data disk..."
     if ! mount | grep -q /data; then
         sudo mkfs.ext4 -F /dev/vdb
         sudo mkdir -p /data
@@ -27,21 +56,23 @@ if lsblk | grep -q vdb; then
     fi
     echo "  Data disk mounted at /data"
 else
-    echo "[1/7] No data disk found, using system disk"
+    echo "[${STEP}] No data disk found, using system disk"
     sudo mkdir -p /data
     sudo chown -R "$USER:$USER" /data
 fi
 
-# ── [2/7] System packages ─────────────────────────────────────────
+# ── System packages ──────────────────────────────────────────────
+STEP=$((STEP + 1))
 echo ""
-echo "[2/7] Installing system packages..."
+echo "[${STEP}] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq python3-pip python3-venv tmux htop > /dev/null 2>&1
 echo "  Done"
 
-# ── [3/7] NVIDIA driver ──────────────────────────────────────────
+# ── NVIDIA driver ────────────────────────────────────────────────
+STEP=$((STEP + 1))
 echo ""
-echo "[3/7] Checking NVIDIA driver..."
+echo "[${STEP}] Checking NVIDIA driver..."
 if command -v nvidia-smi &> /dev/null; then
     GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
     echo "  NVIDIA driver already installed (${GPU_COUNT} GPU(s)):"
@@ -57,22 +88,51 @@ else
     exit 0
 fi
 
-# ── [4/7] Python virtual environment ─────────────────────────────
+# ── Python virtual environment ───────────────────────────────────
+STEP=$((STEP + 1))
 echo ""
-echo "[4/7] Setting up Python environment..."
+echo "[${STEP}] Setting up Python environment..."
 python3 -m venv /data/venv
 source /data/venv/bin/activate
 pip install --upgrade pip -q
+pip install openai huggingface_hub -q
 
-# ── [5/7] Install vLLM and dependencies ──────────────────────────
+# ── Engine-specific install ──────────────────────────────────────
+STEP=$((STEP + 1))
 echo ""
-echo "[5/7] Installing vLLM and OpenAI SDK..."
-pip install vllm openai huggingface_hub -q
-echo "  vLLM version: $(python3 -c 'import vllm; print(vllm.__version__)')"
+if [ "$ENGINE" = "vllm" ]; then
+    echo "[${STEP}] Installing vLLM..."
+    pip install vllm -q
+    echo "  vLLM version: $(python3 -c 'import vllm; print(vllm.__version__)')"
+else
+    echo "[${STEP}] Installing Docker + TACO-X..."
 
-# ── [6/7] Download model ─────────────────────────────────────────
+    if command -v docker &> /dev/null; then
+        echo "  Docker already installed: $(docker --version)"
+    else
+        echo "  Installing Docker via Tencent mirror..."
+        curl -s -L http://mirrors.tencent.com/install/GPU/taco/get-docker.sh | sudo bash
+        echo "  Docker installed: $(docker --version)"
+    fi
+
+    if docker info 2>/dev/null | grep -q "nvidia"; then
+        echo "  nvidia runtime already available"
+    else
+        echo "  Installing nvidia-docker2 via Tencent mirror..."
+        curl -s -L http://mirrors.tencent.com/install/GPU/taco/get-nvidiadocker2.sh | sudo bash
+        sudo systemctl restart docker
+        echo "  nvidia-docker2 installed"
+    fi
+
+    echo "  Pulling TACO-X image (first pull ~5 min)..."
+    docker pull "$TACO_X_IMAGE"
+    echo "  TACO-X image ready"
+fi
+
+# ── Download model ───────────────────────────────────────────────
+STEP=$((STEP + 1))
 echo ""
-echo "[6/7] Downloading model: ${MODEL} (~65 GB)..."
+echo "[${STEP}] Downloading model: ${MODEL} (~65 GB)..."
 echo "  This will take 15-30 min depending on bandwidth."
 export HF_HUB_CACHE=/data/hf_cache
 python3 -c "
@@ -81,49 +141,139 @@ snapshot_download('${MODEL}', cache_dir='/data/hf_cache')
 print('  Model downloaded successfully')
 "
 
-# ── [7/7] Verification ───────────────────────────────────────────
+# ── Verification ─────────────────────────────────────────────────
+STEP=$((STEP + 1))
 echo ""
-echo "[7/7] Verification"
+echo "[${STEP}] Verification"
 echo "============================================"
 echo "  GPU:     $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "  GPUs:    $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l) devices"
 echo "  VRAM:    $(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1) per GPU"
 echo "  Python:  $(python3 --version)"
-echo "  vLLM:    $(python3 -c 'import vllm; print(vllm.__version__)')"
+if [ "$ENGINE" = "vllm" ]; then
+    echo "  vLLM:    $(python3 -c 'import vllm; print(vllm.__version__)')"
+else
+    echo "  Docker:  $(docker --version)"
+    echo "  Image:   $TACO_X_IMAGE"
+fi
 echo "  Model:   ${MODEL}"
 echo "============================================"
 echo ""
-echo "Setup complete! To start the vLLM server:"
+echo "Setup complete!"
 echo ""
-echo "  source /data/venv/bin/activate"
-echo "  export HF_HUB_CACHE=/data/hf_cache"
-echo ""
-echo "  # Start in tmux so the server persists after disconnect"
-echo "  tmux new -s vllm"
-echo ""
-echo "  # RECOMMENDED: enforce-eager mode (stable, avoids CUDA graph OOM)"
-echo "  vllm serve ${MODEL} \\"
-echo "    --dtype bfloat16 \\"
-echo "    --tensor-parallel-size 2 \\"
-echo "    --max-model-len 8192 \\"
-echo "    --gpu-memory-utilization 0.95 \\"
-echo "    --enforce-eager \\"
-echo "    --enable-prefix-caching \\"
-echo "    --enable-chunked-prefill \\"
-echo "    --port 8000"
-echo ""
-echo "  # ALTERNATIVE: CUDA graphs mode (requires lower memory settings)"
-echo "  # CUDA graph capture needs extra GPU headroom — 0.95/0.90 both OOM."
-echo "  vllm serve ${MODEL} \\"
-echo "    --dtype bfloat16 \\"
-echo "    --tensor-parallel-size 2 \\"
-echo "    --max-model-len 4096 \\"
-echo "    --gpu-memory-utilization 0.85 \\"
-echo "    --enable-prefix-caching \\"
-echo "    --enable-chunked-prefill \\"
-echo "    --port 8000"
-echo ""
-echo "  # Run benchmark (from another terminal):"
-echo "  source /data/venv/bin/activate"
-echo "  python3 benchmark.py --base-url http://localhost:8000/v1 \\"
-echo "    --model ${MODEL} --concurrency 1,5,10 --save"
+
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+
+if [ "$ENGINE" = "vllm" ]; then
+    # ── Launch vLLM server ───────────────────────────────────────
+    STEP=$((STEP + 1))
+    echo ""
+    echo "[${STEP}] Launching vLLM in tmux session 'vllm'..."
+
+    # Kill existing session if any
+    tmux kill-session -t vllm 2>/dev/null || true
+
+    VLLM_CMD="source /data/venv/bin/activate && export HF_HUB_CACHE=/data/hf_cache && vllm serve ${MODEL} \
+        --dtype bfloat16 \
+        --tensor-parallel-size ${GPU_COUNT} \
+        --max-model-len 8192 \
+        --gpu-memory-utilization 0.95 \
+        --enforce-eager \
+        --enable-prefix-caching \
+        --enable-chunked-prefill \
+        --port 8000"
+
+    tmux new-session -d -s vllm "$VLLM_CMD"
+
+    echo ""
+    echo "============================================"
+    echo "  vLLM launching on port 8000"
+    echo "============================================"
+    echo ""
+    echo "  Model:  ${MODEL}"
+    echo "  TP:     ${GPU_COUNT}"
+    echo "  Port:   8000"
+    echo ""
+    echo "  Monitor startup logs:"
+    echo "    tmux attach -t vllm"
+    echo ""
+    echo "  Wait for 'Application startup complete', then run benchmark:"
+    echo ""
+    echo "  source /data/venv/bin/activate"
+    echo "  python3 benchmark.py --base-url http://localhost:8000/v1 \\"
+    echo "    --model ${MODEL} --concurrency 1,5,10 --save"
+else
+    # ── Launch TACO-X container ──────────────────────────────────
+    STEP=$((STEP + 1))
+    echo ""
+    echo "[${STEP}] Launching TACO-X container..."
+
+    MODEL_TYPE="qwen3_32b"
+    CONFIG_DIR="/workspace/qwen3_32b_taco_x_config"
+    CONTAINER_NAME="taco_x"
+    PORT=18080
+
+    # Stop existing vLLM if running
+    tmux kill-session -t vllm 2>/dev/null && echo "  Stopped vLLM tmux session" || true
+
+    # Locate model snapshot
+    MODEL_DIR=$(ls -d /data/hf_cache/models--Qwen--Qwen3-32B/snapshots/*/ 2>/dev/null | head -1)
+    if [ -z "${MODEL_DIR:-}" ]; then
+        echo "  ERROR: Model not found at /data/hf_cache/models--Qwen--Qwen3-32B/"
+        exit 1
+    fi
+    echo "  Model found: $MODEL_DIR"
+
+    # Remove existing container if any
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo "  Removing existing container '$CONTAINER_NAME'..."
+        docker rm -f "$CONTAINER_NAME"
+    fi
+
+    # Build docker run command
+    DOCKER_ARGS=(
+        -itd
+        --gpus all
+        --privileged --cap-add=IPC_LOCK
+        --ulimit memlock=-1 --ulimit stack=67108864
+        --net=host --ipc=host
+        -v /data:/data
+        --name="$CONTAINER_NAME"
+        --entrypoint python3
+    )
+
+    TACO_ARGS=(
+        -m taco_x.api_server
+        --model_dir "$MODEL_DIR"
+        --model_type "$MODEL_TYPE"
+        --config_dir "$CONFIG_DIR"
+        --port "$PORT"
+    )
+
+    # Auto-detect GPU count for TP
+    if [ "$GPU_COUNT" -gt 1 ]; then
+        TACO_ARGS+=(--tp "$GPU_COUNT")
+        echo "  Tensor parallelism: $GPU_COUNT (auto-detected)"
+    fi
+
+    echo "  Launching container..."
+    docker run "${DOCKER_ARGS[@]}" "$TACO_X_IMAGE" "${TACO_ARGS[@]}"
+
+    echo ""
+    echo "============================================"
+    echo "  TACO-X launched on port $PORT"
+    echo "============================================"
+    echo ""
+    echo "  Model:      $MODEL_DIR"
+    echo "  Model type: $MODEL_TYPE"
+    echo "  Port:       $PORT"
+    echo ""
+    echo "  Monitor startup logs:"
+    echo "    docker logs -f $CONTAINER_NAME"
+    echo ""
+    echo "  Wait for 'Application startup complete', then run benchmark:"
+    echo ""
+    echo "  source /data/venv/bin/activate"
+    echo "  python3 benchmark.py --base-url http://localhost:${PORT}/v1 \\"
+    echo "    --model $MODEL_DIR --concurrency 1,5,10 --save"
+fi

@@ -122,53 +122,48 @@ cp .env.example .env
 # Set REMOTE_IP from: terraform output instance_ip
 ```
 
-### 3. Deploy
+### 3. Deploy & Setup
 
 ```bash
 ./deploy.sh
 ```
 
-Uploads `setup.sh`, `benchmark.py`, `chat.py` and runs setup (~25-45 min).
+Uploads `setup.sh`, `benchmark.py`, `chat.py` to the instance.
 
-### 4a. Start vLLM
+Then SSH in and run setup for your chosen engine:
 
 ```bash
 ssh -i <your-ssh-key> ubuntu@<IP>
-source /data/venv/bin/activate
-export HF_HUB_CACHE=/data/hf_cache
-tmux new -s vllm
 
-# 2x L20:
-vllm serve Qwen/Qwen3-32B \
-    --dtype bfloat16 \
-    --tensor-parallel-size 2 \
-    --max-model-len 8192 \
-    --gpu-memory-utilization 0.95 \
-    --enforce-eager \
-    --enable-prefix-caching \
-    --enable-chunked-prefill \
-    --port 8000
+# For vLLM:
+bash setup.sh --vllm
 
-# 4x L20:
-vllm serve Qwen/Qwen3-32B \
-    --dtype bfloat16 \
-    --tensor-parallel-size 4 \
-    --max-model-len 8192 \
-    --gpu-memory-utilization 0.95 \
-    --enforce-eager \
-    --enable-prefix-caching \
-    --enable-chunked-prefill \
-    --port 8000
+# For TACO-X (image URL from your Tencent Cloud rep):
+export TACO_X_IMAGE="ccr.ccs.tencentyun.com/taco/taco_x_prod:<tag>"
+bash setup.sh --tacox
 ```
 
-### 4b. Start TACO-X (alternative)
+Setup takes ~25-45 min: mounts data disk, installs NVIDIA drivers, creates Python venv, installs the engine (vLLM pip package or Docker + TACO-X image), and downloads the model (~65 GB).
 
-The TACO-X Docker image is private. Contact your Tencent Cloud representative to obtain access.
+### 4a. vLLM
+
+`setup.sh --vllm` automatically launches vLLM in a tmux session. Monitor logs:
 
 ```bash
-export TACO_X_IMAGE="<image-url-from-tencent>"
-bash taco_x_start.sh          # auto-detects GPU count for TP
+tmux attach -t vllm
 ```
+
+Wait for `Application startup complete`, then proceed to benchmark.
+
+### 4b. TACO-X
+
+`setup.sh --tacox` automatically launches the TACO-X container after installation. Monitor logs:
+
+```bash
+docker logs -f taco_x
+```
+
+Wait for `Application startup complete`, then proceed to benchmark.
 
 ### 5. Run Benchmark
 
@@ -204,8 +199,7 @@ Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use
 | `outputs.tf` | Terraform outputs (instance IP, SSH command) |
 | `configs/*.tfvars` | Per-setup presets (vllm-2xl20, tacox-4xl20, etc.) |
 | `terraform.tfvars.example` | Base config template (credentials, network) |
-| `setup.sh` | Instance bootstrap (venv, vLLM, model download) |
-| `taco_x_start.sh` | TACO-X container launcher |
+| `setup.sh` | Instance bootstrap: `--vllm` or `--tacox` (drivers, Python, engine, model, launch) |
 | `deploy.sh` | Upload scripts and run setup remotely |
 | `benchmark.py` | Concurrent benchmark with percentile reporting |
 | `chat.py` | Interactive multi-turn chat client |
