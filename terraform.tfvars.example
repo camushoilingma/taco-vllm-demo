@@ -1,0 +1,30 @@
+# Base config — shared across all setups.
+# Copy to terraform.tfvars and fill in your values.
+# Then layer a config preset on top:
+#   terraform apply -var-file=configs/vllm-2xl20.tfvars
+#   terraform apply -var-file=configs/tacox-4xl20.tfvars
+
+secret_id  = "YOUR_SECRET_ID"
+secret_key = "YOUR_SECRET_KEY"
+
+region            = "ap-tokyo"
+availability_zone = "ap-tokyo-2"
+
+vpc_id    = "vpc-XXXXXXXX"
+subnet_id = "subnet-XXXXXXXX"
+bandwidth = 150
+
+key_id = "skey-XXXXXXXX"
+my_ip  = "YOUR_IP/32"          # curl -s https://checkip.amazonaws.com
+
+# Override these per-setup or via configs/*.tfvars
+instance_name       = "taco-benchmark"
+instance_type       = "PNV5b.16XLARGE192"
+image_id            = "img-487zeit5"      # Ubuntu 22.04 LTS (Tokyo)
+system_disk_size    = 100
+data_disk_size      = 200
+security_group_name = "taco-benchmark-sg"
+
+tags = {}
+
+disable_terminate = false

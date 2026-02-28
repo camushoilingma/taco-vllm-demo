@@ -1,0 +1,20 @@
+# Secrets
+.env
+*.pem
+
+# Terraform
+*.tfvars
+!terraform.tfvars.example
+!configs/*.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+tfplan
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
