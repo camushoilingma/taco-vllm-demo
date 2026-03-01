@@ -178,9 +178,10 @@ if [ "$ENGINE" = "vllm" ]; then
         --tensor-parallel-size ${GPU_COUNT} \
         --max-model-len 8192 \
         --gpu-memory-utilization 0.95 \
-        --enforce-eager \
         --enable-prefix-caching \
         --enable-chunked-prefill \
+        --cudagraph-capture-sizes 1 2 4 8 \
+        --disable-custom-all-reduce \
         --port 8000"
 
     tmux new-session -d -s vllm "$VLLM_CMD"
@@ -248,6 +249,7 @@ else
         --model_type "$MODEL_TYPE"
         --config_dir "$CONFIG_DIR"
         --port "$PORT"
+        --opt-level 3
     )
 
     # Auto-detect GPU count for TP
