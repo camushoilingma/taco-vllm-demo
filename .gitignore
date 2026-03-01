@@ -18,3 +18,7 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Benchmark results (local only, described in README)
+results-tp4/
+results/

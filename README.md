@@ -204,7 +204,7 @@ Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use
 | `benchmark.py` | Concurrent benchmark with percentile reporting |
 | `chat.py` | Interactive multi-turn chat client |
 | `.env.example` | SSH connection template |
-| `results-tp4/best-comparison/` | Best-of TP=4 benchmark CSVs and comparison |
+
 
 ## Cleanup
 
