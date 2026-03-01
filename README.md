@@ -8,45 +8,47 @@ TACO-X is Tencent's proprietary LLM inference engine, built as a high-performanc
 
 TACO-X is distributed as a private Docker image — contact your Tencent Cloud representative for access. It exposes an OpenAI-compatible API, so benchmarks and client code work unchanged between the two engines.
 
-## Benchmark Results (2026-02-28, vLLM v0.16.0)
+## Benchmark Results (2026-03-01, TP=4, vLLM v0.16.0)
 
 ### Summary
 
-- TACO-X achieves **~4.5x higher throughput** and **~6x lower per-token latency** than vLLM
-- CUDA graphs provide only ~2-3% improvement in vLLM — the bottleneck is not kernel launch overhead
-- TTFT is comparable across all three (~55-62ms at concurrency 1)
+- TACO-X achieves **~3x higher throughput** and **~3.8x lower per-token latency** than vLLM at low concurrency
+- At high concurrency (10), the two engines converge to similar throughput
+- TTFT is comparable at concurrency 1 (~575-595ms); TACO-X shows higher tail latency at concurrency 10
+
+Each engine is shown in its best configuration: **TACO-X with opt-level 3** (TileLang JIT-compiled kernels — TACO-X does not use CUDA graphs, its optimized kernels replace that need) and **vLLM with CUDA graphs** (captures and replays GPU kernel sequences to reduce launch overhead, the recommended production mode for vLLM).
 
 ### Throughput (tok/s, higher is better)
 
-| Prompt | Conc | TACO-X | vLLM (enforce-eager) | vLLM (CUDA graphs) |
-|--------|------|--------|----------------------|---------------------|
-| short | 1 | **1,003** | 216 | 221 |
-| short | 5 | **594** | 201 | 208 |
-| short | 10 | **864** | 197 | 200 |
-| medium | 1 | **1,103** | 215 | 220 |
-| medium | 5 | **429** | 200 | 207 |
-| medium | 10 | **833** | 196 | 201 |
-| long | 1 | **912** | 215 | 220 |
-| long | 5 | **894** | 197 | 204 |
-| long | 10 | **828** | 191 | 196 |
+| Prompt | Conc | TACO-X (opt-level 3) | vLLM (CUDA graphs) |
+|--------|------|----------------------|---------------------|
+| short  | 1    | **1,102**            | 348                 |
+| short  | 5    | **417**              | 322                 |
+| short  | 10   | 308                  | **307**             |
+| medium | 1    | **987**              | 349                 |
+| medium | 5    | **407**              | 323                 |
+| medium | 10   | **324**              | 305                 |
+| long   | 1    | **1,033**            | 348                 |
+| long   | 5    | **406**              | 319                 |
+| long   | 10   | 262                  | **298**             |
 
 ### Latency — TPOT p50 (ms, lower is better)
 
-| Prompt | Conc | TACO-X | vLLM (enforce-eager) | vLLM (CUDA graphs) |
-|--------|------|--------|----------------------|---------------------|
-| short | 1 | **7.5** | 46.3 | 45.3 |
-| short | 5 | **15.9** | 49.4 | 47.7 |
-| short | 10 | **11.1** | 50.2 | 49.4 |
-| medium | 1 | **8.5** | 46.4 | 45.3 |
-| medium | 5 | **23.0** | 49.6 | 47.9 |
-| medium | 10 | **11.6** | 50.7 | 49.4 |
-| long | 1 | **9.8** | 46.6 | 45.4 |
-| long | 5 | **10.8** | 50.3 | 48.5 |
-| long | 10 | **11.5** | 51.7 | 50.4 |
+| Prompt | Conc | TACO-X (opt-level 3) | vLLM (CUDA graphs) |
+|--------|------|----------------------|---------------------|
+| short  | 1    | **6.8**              | 26.5                |
+| short  | 5    | **20.9**             | 28.7                |
+| short  | 10   | **26.6**             | 30.1                |
+| medium | 1    | **7.9**              | 26.5                |
+| medium | 5    | **22.1**             | 28.7                |
+| medium | 10   | **26.2**             | 30.3                |
+| long   | 1    | **7.5**              | 26.6                |
+| long   | 5    | **22.2**             | 29.0                |
+| long   | 10   | 34.4                 | **31.0**            |
 
 ### Methodology
 
-Each engine served Qwen3-32B FP16 with TP=2 on 2x L20 48GB GPUs. The benchmark script (`benchmark.py`) sends 10 requests per configuration using short (~50 tok), medium (~200 tok), and long (~500 tok) prompts at varying concurrency levels (1, 5, 10). It measures streaming throughput (tokens/s), time-to-first-token (TTFT), and time-per-output-token (TPOT) at p50/p90/p99 percentiles. vLLM was tested in both enforce-eager and CUDA graph modes.
+Each engine served Qwen3-32B FP16 with TP=4 on 4x L20 48GB GPUs. The benchmark script (`benchmark.py`) sends 10 requests per configuration using short (~50 tok), medium (~200 tok), and long (~500 tok) prompts at varying concurrency levels (1, 5, 10). It measures streaming throughput (tokens/s), time-to-first-token (TTFT), and time-per-output-token (TPOT) at p50/p90/p99 percentiles. vLLM was tested in both eager and CUDA graph modes.
 
 ### Architecture Comparison
 
@@ -95,9 +97,7 @@ One set of Terraform files, multiple presets via `configs/*.tfvars`:
 
 | Config | Instance Type | GPUs | vCPU | RAM | Disk |
 |--------|---------------|------|------|-----|------|
-| `vllm-2xl20` | PNV5b.16XLARGE192 | 2x L20 | 64 | 192 GB | 200 GB |
 | `vllm-4xl20` | PNV5b.48XLARGE768 | 4x L20 | 192 | 768 GB | 500 GB |
-| `tacox-2xl20` | PNV5b.16XLARGE192 | 2x L20 | 64 | 192 GB | 200 GB |
 | `tacox-4xl20` | PNV5b.48XLARGE768 | 4x L20 | 192 | 768 GB | 500 GB |
 
 ## Quick Start
@@ -111,7 +111,7 @@ cp terraform.tfvars.example terraform.tfvars
 terraform init
 
 # Pick a configuration:
-terraform apply -var-file=configs/vllm-2xl20.tfvars
+terraform apply -var-file=configs/vllm-4xl20.tfvars
 # or: terraform apply -var-file=configs/tacox-4xl20.tfvars
 ```
 
@@ -184,11 +184,11 @@ python3 benchmark.py --base-url http://localhost:18080/v1 \
 
 ### CUDA Graph Capture OOM (vLLM)
 
-Qwen3-32B FP16 on 2x L20 leaves only ~58 MiB free after weight loading + KV cache allocation. CUDA graph capture fails at `--gpu-memory-utilization` 0.95 and 0.90. Use `--enforce-eager`, or drop to 0.85 with `--max-model-len 4096`.
+Qwen3-32B FP16 on L20 GPUs can leave very little free VRAM after weight loading + KV cache allocation. CUDA graph capture may fail at high `--gpu-memory-utilization`. Use `--enforce-eager`, or drop to 0.85 with `--max-model-len 4096`.
 
 ### Tensor Parallelism Required
 
-Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use `--tensor-parallel-size 2` or higher.
+Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use `--tensor-parallel-size 4`.
 
 ## Files
 
@@ -197,7 +197,7 @@ Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use
 | `main.tf` | Terraform: GPU instance + security group |
 | `variables.tf` | Terraform variable definitions |
 | `outputs.tf` | Terraform outputs (instance IP, SSH command) |
-| `configs/*.tfvars` | Per-setup presets (vllm-2xl20, tacox-4xl20, etc.) |
+| `configs/*.tfvars` | Per-setup presets (vllm-4xl20, tacox-4xl20) |
 | `terraform.tfvars.example` | Base config template (credentials, network) |
 | `setup.sh` | Instance bootstrap: `--vllm` or `--tacox` (drivers, Python, engine, model, launch) |
 | `deploy.sh` | Upload scripts and run setup remotely |
@@ -209,5 +209,21 @@ Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use
 ## Cleanup
 
 ```bash
-terraform destroy -var-file=configs/vllm-2xl20.tfvars
+terraform destroy -var-file=configs/vllm-4xl20.tfvars
 ```
+
+## Disclaimers
+
+**Hardware**: These benchmarks were run on **4x L20 48GB GPUs connected via PCIe 4.0** (no NVLink). Production LLM deployments typically use NVLink-connected GPUs (H100, H20, A100 SXM), which provide ~28x higher inter-GPU bandwidth. The PCIe bottleneck in our setup adds latency to every decode step's all-reduce and may disproportionately affect both engines' results compared to NVLink hardware. CUDA graphs also failed to provide any benefit here and hung with default settings — this is likely PCIe-specific and may not apply to NVLink systems.
+
+**TACO-X configuration**: TACO-X was run with **constrained scheduler settings** (`max_num_seqs=8`, `gpu_memory_utilization=0.2` for KV cache) — not a fully tuned production configuration. vLLM was run with `gpu_memory_utilization=0.85`, chunked prefill, and prefix caching enabled. The high-concurrency results (c=10) where TACO-X's throughput degrades and TTFT spikes to 1549ms likely reflect these scheduler constraints rather than a fundamental engine limitation. A fully unconstrained TACO-X configuration may perform differently.
+
+**Model support**: TACO-X logged a warning that `ModelType: qwen3` is not directly supported and fell back to `DefaultWeightsProcessor`. This means the benchmark may not reflect TACO-X's full optimization potential for Qwen3-32B specifically.
+
+**Sample size**: Each configuration was tested with only **10 requests** (plus 2 warmup). This is sufficient for directional comparison but too small for statistically rigorous P99 measurements. Production benchmarks should use 100+ requests.
+
+**Output length**: All tests used `--max-tokens 256`. TACO-X's decode advantage would be more pronounced with longer outputs (1024-2048 tokens), since the faster per-token generation compounds over more tokens. The current benchmark under-represents TACO-X's value for long-form generation use cases.
+
+**Single model, single hardware**: Results are for Qwen3-32B FP16 on L20 GPUs only. Performance characteristics may differ significantly on other models (7B, 70B, MoE), other precisions (FP8, INT4), or other GPU families (H100, H20, A100).
+
+**TP=4 only**: This benchmark has only been tested to run consistently with TP=4. TP=2 configurations were attempted but produced unreliable results and are not supported.

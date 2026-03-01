@@ -17,10 +17,13 @@ import argparse
 import asyncio
 import csv
 import json
+import os
+import platform
 import subprocess
 import statistics
 import time
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Optional
 
 from openai import AsyncOpenAI
@@ -392,6 +395,203 @@ def get_gpu_memory_mb():
         return None, None
 
 
+def _run_cmd(cmd: str, timeout: int = 10) -> str:
+    """Run a shell command and return stdout, or empty string on failure."""
+    try:
+        return subprocess.check_output(
+            cmd, shell=True, text=True, stderr=subprocess.DEVNULL, timeout=timeout,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def collect_environment(base_url: str, model: str, max_tokens: int,
+                        concurrency_levels: list, prompt_sizes: list,
+                        num_requests: int, warmup: int,
+                        launch_command: str = None) -> dict:
+    """Collect full test environment details: hardware, engine, launch command, etc."""
+    env = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "hostname": platform.node(),
+        "os": _run_cmd("uname -srm") or f"{platform.system()} {platform.release()}",
+        "base_url": base_url,
+        "model": model,
+        "max_tokens": max_tokens,
+        "concurrency_levels": concurrency_levels,
+        "prompt_sizes": prompt_sizes,
+        "num_requests": num_requests,
+        "warmup": warmup,
+    }
+
+    # ── GPU info ──
+    gpu_names = _run_cmd(
+        "nvidia-smi --query-gpu=name,memory.total,driver_version "
+        "--format=csv,noheader"
+    )
+    if gpu_names:
+        env["gpu_info"] = gpu_names
+        env["gpu_count"] = len(gpu_names.strip().split("\n"))
+    else:
+        env["gpu_info"] = "not available"
+        env["gpu_count"] = 0
+
+    # ── CUDA version ──
+    env["cuda_version"] = _run_cmd(
+        "nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1"
+    ) or _run_cmd("nvcc --version | grep release | awk '{print $6}'") or "unknown"
+
+    # ── Detect engine: vLLM process or TACO-X Docker container ──
+    env["engine"] = "unknown"
+    env["engine_version"] = "unknown"
+    env["launch_command"] = "unknown"
+    env["dtype"] = "unknown"
+    env["quantization"] = "none"
+    env["tensor_parallel"] = "unknown"
+
+    # Check for vLLM process
+    vllm_cmd = _run_cmd("ps aux | grep '[v]llm.entrypoints' | head -1")
+    if not vllm_cmd:
+        vllm_cmd = _run_cmd("ps aux | grep '[v]llm serve' | head -1")
+
+    if vllm_cmd:
+        env["engine"] = "vllm"
+        # Extract the full command (everything after the first python path)
+        parts = vllm_cmd.split()
+        # Find where python3/python starts
+        cmd_start = next((i for i, p in enumerate(parts) if "python" in p), 2)
+        env["launch_command"] = " ".join(parts[cmd_start:])
+
+        # Parse key flags from the command
+        for i, p in enumerate(parts):
+            if p == "--dtype" and i + 1 < len(parts):
+                env["dtype"] = parts[i + 1]
+            if p == "--tensor-parallel-size" and i + 1 < len(parts):
+                env["tensor_parallel"] = parts[i + 1]
+            if p == "--quantization" and i + 1 < len(parts):
+                env["quantization"] = parts[i + 1]
+            if p == "--enforce-eager":
+                env["cuda_graphs"] = False
+            if p == "--gpu-memory-utilization" and i + 1 < len(parts):
+                env["gpu_memory_utilization"] = parts[i + 1]
+            if p == "--enable-prefix-caching":
+                env["prefix_caching"] = True
+            if p == "--enable-chunked-prefill":
+                env["chunked_prefill"] = True
+            if p == "--max-model-len" and i + 1 < len(parts):
+                env["max_model_len"] = parts[i + 1]
+
+        # Get vLLM version
+        env["engine_version"] = _run_cmd(
+            "python3 -c 'import vllm; print(vllm.__version__)'"
+        ) or "unknown"
+
+    # Check for TACO-X Docker container
+    tacox_containers = _run_cmd(
+        "docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -i taco"
+    )
+    if tacox_containers:
+        env["engine"] = "taco-x"
+        container_line = tacox_containers.split("\n")[0]
+        container_name = container_line.split()[0]
+        container_image = container_line.split()[1] if len(container_line.split()) > 1 else ""
+        env["engine_version"] = container_image
+
+        # Get the full docker run / entrypoint command
+        inspect_cmd = _run_cmd(
+            f"docker inspect --format '{{{{.Config.Entrypoint}}}} {{{{.Config.Cmd}}}}' {container_name}"
+        )
+        if inspect_cmd:
+            env["launch_command"] = inspect_cmd
+
+        # Also try to get the full docker run recreation command
+        docker_run_cmd = _run_cmd(
+            f"docker inspect --format 'docker run "
+            f"--gpus={{{{index .HostConfig.DeviceRequests 0 \"Count\"}}}} "
+            f"-p {{{{range .HostConfig.PortBindings}}}}{{{{(index . 0).HostPort}}}}{{{{end}}}} "
+            f"--name={{{{.Name}}}} "
+            f"{{{{.Config.Image}}}} "
+            f"{{{{range .Config.Cmd}}}}{{{{.}}}} {{{{end}}}}' {container_name}"
+        )
+        if docker_run_cmd:
+            env["docker_run_command"] = docker_run_cmd
+
+        # Parse TACO-X args from container CMD
+        cmd_args = _run_cmd(
+            f"docker inspect --format '{{{{json .Config.Cmd}}}}' {container_name}"
+        )
+        if cmd_args:
+            env["container_cmd"] = cmd_args
+            try:
+                args_list = json.loads(cmd_args)
+                for i, p in enumerate(args_list):
+                    if p == "--model_type" and i + 1 < len(args_list):
+                        env["model_type"] = args_list[i + 1]
+                    if p == "--tp" and i + 1 < len(args_list):
+                        env["tensor_parallel"] = args_list[i + 1]
+                    if p == "--opt-level" and i + 1 < len(args_list):
+                        env["opt_level"] = args_list[i + 1]
+                    if p == "--quantization" and i + 1 < len(args_list):
+                        env["quantization"] = args_list[i + 1]
+                    if p == "--port" and i + 1 < len(args_list):
+                        env["port"] = args_list[i + 1]
+                    if p == "--config_dir" and i + 1 < len(args_list):
+                        env["config_dir"] = args_list[i + 1]
+                    if p == "--model_dir" and i + 1 < len(args_list):
+                        env["model_dir"] = args_list[i + 1]
+            except json.JSONDecodeError:
+                pass
+
+    # ── System memory ──
+    env["system_memory"] = _run_cmd("free -h | grep Mem | awk '{print $2}'") or "unknown"
+
+    # ── CPU info ──
+    env["cpu"] = _run_cmd("lscpu | grep 'Model name' | sed 's/Model name: *//'") or \
+                 _run_cmd("sysctl -n machdep.cpu.brand_string") or "unknown"
+    env["cpu_count"] = _run_cmd("nproc") or _run_cmd("sysctl -n hw.ncpu") or "unknown"
+
+    # ── Override launch command if provided ──
+    if launch_command:
+        env["launch_command"] = launch_command
+
+    return env
+
+
+def print_environment(env: dict):
+    """Print a summary of the captured environment."""
+    print()
+    print("=" * 90)
+    print("  TEST ENVIRONMENT")
+    print("=" * 90)
+    print(f"  Timestamp:     {env.get('timestamp', 'unknown')}")
+    print(f"  Hostname:      {env.get('hostname', 'unknown')}")
+    print(f"  OS:            {env.get('os', 'unknown')}")
+    print(f"  CPU:           {env.get('cpu', 'unknown')} ({env.get('cpu_count', '?')} cores)")
+    print(f"  System Memory: {env.get('system_memory', 'unknown')}")
+    print(f"  GPU:           {env.get('gpu_info', 'unknown')}")
+    print(f"  GPU Count:     {env.get('gpu_count', 'unknown')}")
+    print(f"  CUDA Driver:   {env.get('cuda_version', 'unknown')}")
+    print(f"  Engine:        {env.get('engine', 'unknown')}")
+    print(f"  Engine Ver:    {env.get('engine_version', 'unknown')}")
+    print(f"  Launch Cmd:    {env.get('launch_command', 'unknown')}")
+    if env.get("docker_run_command"):
+        print(f"  Docker Run:    {env['docker_run_command']}")
+    if env.get("container_cmd"):
+        print(f"  Container CMD: {env['container_cmd']}")
+    print(f"  Model:         {env.get('model', 'unknown')}")
+    print(f"  Dtype:         {env.get('dtype', 'unknown')}")
+    print(f"  Quantization:  {env.get('quantization', 'none')}")
+    print(f"  TP:            {env.get('tensor_parallel', 'unknown')}")
+    if env.get("opt_level"):
+        print(f"  Opt Level:     {env['opt_level']}")
+    if env.get("max_model_len"):
+        print(f"  Max Model Len: {env['max_model_len']}")
+    if env.get("gpu_memory_utilization"):
+        print(f"  GPU Mem Util:  {env['gpu_memory_utilization']}")
+    print(f"  Server:        {env.get('base_url', 'unknown')}")
+    print("=" * 90)
+    print()
+
+
 def fmt(val, suffix="", decimals=1, width=8):
     """Format a numeric value, returning '—' if None."""
     if val is None:
@@ -507,24 +707,39 @@ def print_multi_turn_results(turn_results: list):
 
 
 def save_results(filepath: str, configs: list, multi_turn: list,
-                 gpu_info: tuple = (None, None), num_requests: int = 10):
+                 gpu_info: tuple = (None, None), num_requests: int = 10,
+                 environment: dict = None):
     """Save results to CSV or JSON based on file extension."""
     if filepath.endswith(".csv"):
-        save_csv(filepath, configs, multi_turn, gpu_info, num_requests)
+        save_csv(filepath, configs, multi_turn, gpu_info, num_requests, environment)
     else:
-        save_json(filepath, configs, multi_turn, gpu_info, num_requests)
+        save_json(filepath, configs, multi_turn, gpu_info, num_requests, environment)
     print(f"\nResults saved to {filepath}")
 
 
 def save_csv(filepath: str, configs: list, multi_turn: list,
-             gpu_info: tuple = (None, None), num_requests: int = 10):
+             gpu_info: tuple = (None, None), num_requests: int = 10,
+             environment: dict = None):
     """Save results as a flat CSV with one row per config."""
     total_failures = sum(c.failures for c in configs)
 
     with open(filepath, "w", newline="") as f:
         writer = csv.writer(f)
 
-        # Metadata row
+        # ── Launch command as first row (always present) ──
+        launch_cmd = (environment or {}).get("launch_command", "unknown")
+        docker_run = (environment or {}).get("docker_run_command", "")
+        if docker_run:
+            writer.writerow([f"# launch_command: {docker_run}"])
+        else:
+            writer.writerow([f"# launch_command: {launch_cmd}"])
+        writer.writerow([])
+
+        # ── Environment section ──
+        writer.writerow(["# === TEST ENVIRONMENT ==="])
+        if environment:
+            for key, value in environment.items():
+                writer.writerow([f"# {key}", str(value)])
         writer.writerow([f"# {num_requests} requests per config"])
         writer.writerow([])
 
@@ -584,9 +799,11 @@ def save_csv(filepath: str, configs: list, multi_turn: list,
 
 
 def save_json(filepath: str, configs: list, multi_turn: list,
-              gpu_info: tuple = (None, None), num_requests: int = 10):
+              gpu_info: tuple = (None, None), num_requests: int = 10,
+              environment: dict = None):
     """Save all results to a JSON file."""
     data = {
+        "environment": environment or {},
         "num_requests_per_config": num_requests,
         "gpu_memory_mb": {"used": gpu_info[0], "total": gpu_info[1]},
         "sweep": [],
@@ -629,18 +846,36 @@ async def async_main():
     parser.add_argument("--warmup", type=int, default=2,
                         help="Warmup requests before timing (default: 2)")
     parser.add_argument("--save", nargs="?", const="auto", metavar="FILE",
-                        help="Save results (default: results-YYYYMMDD-HHMMSS.csv)")
+                        help="Save results (default: {engine}-tp{tp}-YYYYMMDD-HHMMSS.csv)")
+    parser.add_argument("--launch-command", default=None,
+                        help="Override the auto-detected launch command (logged in results file)")
     args = parser.parse_args()
-
-    # Auto-generate filename with timestamp if --save used without a value
-    if args.save == "auto":
-        args.save = time.strftime("results-%Y%m%d-%H%M%S.csv")
 
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     prompt_sizes = [x.strip() for x in args.prompt_sizes.split(",")]
 
     total_configs = len(concurrency_levels) * len(prompt_sizes)
     total_requests = total_configs * (args.num_requests + args.warmup)
+
+    # ── Collect environment before anything else ──
+    environment = collect_environment(
+        base_url=args.base_url,
+        model=args.model,
+        max_tokens=args.max_tokens,
+        concurrency_levels=concurrency_levels,
+        prompt_sizes=prompt_sizes,
+        num_requests=args.num_requests,
+        warmup=args.warmup,
+        launch_command=args.launch_command,
+    )
+    print_environment(environment)
+
+    # Auto-generate filename: {engine}-tp{tp}-{timestamp}.csv
+    if args.save == "auto":
+        engine = environment.get("engine", "unknown")
+        tp = environment.get("tensor_parallel", "?")
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        args.save = f"{engine}-tp{tp}-{timestamp}.csv"
 
     print("=" * 90)
     print("  LLM Inference Benchmark")
@@ -703,7 +938,7 @@ async def async_main():
     # ── Save results ──
     if args.save:
         save_results(args.save, all_configs, multi_turn_results,
-                     (gpu_used, gpu_total), args.num_requests)
+                     (gpu_used, gpu_total), args.num_requests, environment)
 
     print()
 

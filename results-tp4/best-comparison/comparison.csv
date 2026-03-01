@@ -1,0 +1,58 @@
+# Best TP=4 Comparison: TACO-X (opt-level 3, defaults) vs vLLM (CUDA graphs)
+# March 1, 2026 — Qwen3-32B, 4x L20, 10 requests per config, 256 max output tokens
+
+## Throughput (tok/s — higher is better)
+prompt_size,concurrency,tacox_throughput,vllm_throughput,tacox_advantage
+short,1,971.8,348.2,2.8x
+short,5,418.2,322.1,1.3x
+short,10,296.1,307.1,0.96x (vLLM wins)
+medium,1,927.2,348.5,2.7x
+medium,5,406.0,322.5,1.3x
+medium,10,272.7,305.3,0.89x (vLLM wins)
+long,1,1051.9,348.0,3.0x
+long,5,404.3,318.9,1.3x
+long,10,302.6,297.8,1.02x (~tied)
+
+## TPOT p50 (ms — lower is better)
+prompt_size,concurrency,tacox_tpot_p50,vllm_tpot_p50,tacox_advantage
+short,1,6.8,26.5,3.9x faster
+short,5,20.6,28.7,1.4x faster
+short,10,27.4,30.1,1.1x faster
+medium,1,8.0,26.5,3.3x faster
+medium,5,21.9,28.7,1.3x faster
+medium,10,27.0,30.3,1.1x faster
+long,1,6.8,26.6,3.9x faster
+long,5,21.2,29.0,1.4x faster
+long,10,29.8,31.0,1.04x faster
+
+## TTFT p50 (ms — lower is better)
+prompt_size,concurrency,tacox_ttft_p50,vllm_ttft_p50,winner
+short,1,760.9,586.3,vLLM
+short,5,856.8,636.1,vLLM
+short,10,808.4,657.2,vLLM
+medium,1,677.0,575.1,vLLM
+medium,5,727.8,619.5,vLLM
+medium,10,814.6,667.3,vLLM
+long,1,676.6,579.6,vLLM
+long,5,905.2,632.0,vLLM
+long,10,801.6,686.8,vLLM
+
+## E2E Latency p50 (seconds — lower is better)
+prompt_size,concurrency,tacox_e2e_p50,vllm_e2e_p50,tacox_advantage
+short,1,2.54,7.35,2.9x faster
+short,5,6.12,7.96,1.3x faster
+short,10,8.52,8.34,~tied
+medium,1,2.71,7.34,2.7x faster
+medium,5,6.30,7.94,1.3x faster
+medium,10,8.02,8.39,1.05x faster
+long,1,2.42,7.36,3.0x faster
+long,5,6.33,8.02,1.3x faster
+long,10,8.40,8.60,~tied
+
+## Multi-Turn Chat (single user, 256 output tokens per turn)
+turn,context_tokens,tacox_tok_s,vllm_tok_s,tacox_advantage
+1,29,76.8,34.9,2.2x
+2,310,45.8,34.7,1.3x
+3,587,35.4,34.7,1.02x (~tied)
+4,872,39.1,34.6,1.1x
+5,1156,33.4,34.7,0.96x (~tied)

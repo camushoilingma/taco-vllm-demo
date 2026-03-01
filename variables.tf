@@ -34,12 +34,10 @@ variable "instance_name" {
 variable "instance_type" {
   description = <<-EOT
     GPU instance type. Options:
-      PNV5b.8XLARGE96    = 1x L20 48GB,  32 vCPU,  96GB RAM
-      PNV5b.16XLARGE192  = 2x L20 48GB,  64 vCPU, 192GB RAM
       PNV5b.48XLARGE768  = 4x L20 48GB, 192 vCPU, 768GB RAM
   EOT
   type    = string
-  default = "PNV5b.16XLARGE192"
+  default = "PNV5b.48XLARGE768"
 }
 
 variable "image_id" {
@@ -54,9 +52,9 @@ variable "system_disk_size" {
 }
 
 variable "data_disk_size" {
-  description = "Data disk in GB. 200 for 2xL20, 500 for 4xL20 (model + docker image)"
+  description = "Data disk in GB. 500 for 4xL20 (model + docker image)"
   type        = number
-  default     = 200
+  default     = 500
 }
 
 ## ── Network ──
