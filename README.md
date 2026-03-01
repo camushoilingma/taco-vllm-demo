@@ -48,7 +48,7 @@ Each engine is shown in its best configuration: **TACO-X with opt-level 3** (Til
 
 ### Methodology
 
-Each engine served Qwen3-32B FP16 with TP=4 on 4x L20 48GB GPUs. The benchmark script (`benchmark.py`) sends 10 requests per configuration using short (~50 tok), medium (~200 tok), and long (~500 tok) prompts at varying concurrency levels (1, 5, 10). It measures streaming throughput (tokens/s), time-to-first-token (TTFT), and time-per-output-token (TPOT) at p50/p90/p99 percentiles. vLLM was tested in both eager and CUDA graph modes.
+Each engine served Qwen3-32B FP16 with TP=4 on 4x L20 48GB GPUs. The benchmark script (`benchmark.py`) sends 10 requests per configuration using short (~35 tok), medium (~290 tok), and long (~1000 tok) prompts at varying concurrency levels (1, 5, 10). It measures streaming throughput (tokens/s), time-to-first-token (TTFT), and time-per-output-token (TPOT) at p50/p90/p99 percentiles. vLLM was tested in both eager and CUDA graph modes.
 
 ### Architecture Comparison
 
@@ -205,8 +205,6 @@ Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use
 | `chat.py` | Interactive multi-turn chat client |
 | `.env.example` | SSH connection template |
 | `results-tp4/best-comparison/` | Best-of TP=4 benchmark CSVs and comparison |
-| `results-tp4/ANALYSIS.md` | Detailed benchmark analysis |
-| `results-tp4/optimization-comparison.md` | How each engine optimizes differently |
 
 ## Cleanup
 
