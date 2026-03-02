@@ -706,6 +706,27 @@ def print_multi_turn_results(turn_results: list):
                 print("  → Prefix caching not observed (TTFT grows with context)")
 
 
+def upload_to_cos(filepath: str):
+    """Upload file to Tencent COS if COS_BUCKET env var is set."""
+    bucket = os.environ.get("COS_BUCKET")
+    if not bucket:
+        return
+    prefix = os.environ.get("COS_PREFIX", "logs")
+    key = f"{prefix}/{os.path.basename(filepath)}"
+    try:
+        subprocess.run(
+            ["coscmd", "-b", bucket, "upload", filepath, key],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        print(f"  Uploaded to cos://{bucket}/{key}")
+    except FileNotFoundError:
+        print("  COS upload skipped: coscmd not found")
+    except subprocess.CalledProcessError as e:
+        print(f"  COS upload failed: {e.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        print("  COS upload timed out")
+
+
 def save_results(filepath: str, configs: list, multi_turn: list,
                  gpu_info: tuple = (None, None), num_requests: int = 10,
                  environment: dict = None):
@@ -715,6 +736,7 @@ def save_results(filepath: str, configs: list, multi_turn: list,
     else:
         save_json(filepath, configs, multi_turn, gpu_info, num_requests, environment)
     print(f"\nResults saved to {filepath}")
+    upload_to_cos(filepath)
 
 
 def save_csv(filepath: str, configs: list, multi_turn: list,
