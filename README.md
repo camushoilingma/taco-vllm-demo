@@ -4,7 +4,7 @@ Benchmark infrastructure for comparing TACO-X and vLLM serving Qwen3-32B on Tenc
 
 ## What is TACO-X?
 
-TACO-X is Tencent's proprietary LLM inference engine, built as a high-performance alternative to open-source serving frameworks like vLLM. Where vLLM is a Python-first project that relies on PyTorch, torch.compile, and community-maintained CUDA kernels, TACO-X is a C++ engine that uses TileLang JIT-compiled kernels and a custom runtime to maximize GPU utilization.
+TACO-X is Tencent's proprietary LLM inference engine, built as a high-performance alternative to open-source serving frameworks like vLLM. Where vLLM is a Python-first project that relies on PyTorch, torch.compile, and community-maintained CUDA kernels, TACO-X is a C++ engine with a static compute graph for nanosecond-level operator scheduling. Key technologies (confirmed by TACO-X PM): TurboAttention (fused PagedAttention + FlashAttention), TileLang JIT-compiled kernels, reference-counted zero-copy memory management, and Lookahead Cache (training-free speculative decoding, up to 6x+ throughput, average 2.7x). Startup is 70% faster than vLLM (18s vs 66s).
 
 TACO-X is distributed as a private Docker image — contact your Tencent Cloud representative for access. It exposes an OpenAI-compatible API, so benchmarks and client code work unchanged between the two engines.
 
@@ -16,7 +16,7 @@ TACO-X is distributed as a private Docker image — contact your Tencent Cloud r
 - At high concurrency (10), the two engines converge to similar throughput
 - TTFT is comparable at concurrency 1 (~580-760ms); vLLM wins TTFT at all concurrency levels
 
-Each engine is shown in its best configuration: **TACO-X with opt-level 3** (TileLang JIT-compiled kernels — TACO-X does not use CUDA graphs, its optimized kernels replace that need) and **vLLM with CUDA graphs** (captures and replays GPU kernel sequences to reduce launch overhead, the recommended production mode for vLLM).
+Each engine is shown in its best configuration: **TACO-X with opt-level 3** (TileLang JIT-compiled kernels + lookahead speculative decoding) and **vLLM with CUDA graphs** (captures and replays GPU kernel sequences to reduce launch overhead, the recommended production mode for vLLM).
 
 ### Throughput (tok/s, higher is better)
 
@@ -55,41 +55,44 @@ Each engine served Qwen3-32B FP16 with TP=4 on 4x L20 48GB GPUs. The benchmark s
 ```
 Layer                vLLM                              TACO-X
 ─────────────────────────────────────────────────────────────────────────
-1. HTTP Server       FastAPI + Uvicorn (Python)         C++ HTTP server
+1. HTTP Server       FastAPI + Uvicorn (Python)         Uvicorn (Python) + C++ core engine
 
 2. Request Manager   Tokenizer + chat template          Tokenizer + chat template
                      parsing, validation                parsing, validation
 
-3. Scheduler         Continuous batching,               Batching,
-                     preemption                         scheduling
+3. Scheduler         Continuous batching,               Producer-consumer async,
+                     preemption                         static compute graph scheduling
 
-4. KV Cache Manager  PagedAttention block table,        Block allocation,
-                     allocation, eviction,              lookahead cache config
-                     prefix caching
+4. KV Cache Manager  PagedAttention block table,        Block allocation + Lookahead Cache,
+                     allocation, eviction,              multi-level (VRAM/RAM/SSD),
+                     prefix caching                     global prefix caching
 
 5. Model Runner      torch.compile, CUDA graphs         TileLang JIT kernels,
-                     or eager execution                 C++ execution
+                     or eager execution                 C++ static graph execution
 
-6. Attention Backend FlashAttention / FlashInfer        Custom C++ attention
+6. Attention Backend FlashAttention / FlashInfer        TurboAttention
+                                                        (PagedAttn + FlashAttn fused)
 
-7. Linear Kernels    CUTLASS, Marlin (for quant)        TileLang, naive dequant
-                                                        (for unsupported quants)
+7. Linear Kernels    CUTLASS, Marlin (for quant)        TileLang + auto-tuned cublas/cutlass
 
-8. GPU Communication NCCL (for TP sync)                 NCCL (for TP sync)
+8. GPU Communication NCCL (for TP sync)                 NCCL (async TP dispatch)
 
-9. Response Streaming SSE via FastAPI                   SSE via C++ server
+9. Memory Mgmt       PyTorch allocator                  Ref-counted zero-copy,
+                                                        tensor views, memory pool
 ```
 
 ### Key Differences
 
 | Aspect | vLLM | TACO-X |
 |--------|------|--------|
-| Language | Python + PyTorch | C++ + TileLang |
+| Language | Python + PyTorch | C++ + TileLang (static compute graph) |
+| Attention | FlashAttention / FlashInfer | TurboAttention (PagedAttn + FlashAttn fused) |
+| Speculative decode | Requires draft model | Lookahead Cache (training-free, up to 6x+) |
+| Memory mgmt | PyTorch allocator | Ref-counted zero-copy, tensor views, memory pool |
 | Image size | ~8 GB | ~39 GB compressed / 62 GB on disk |
+| Startup time | ~66s (torch.compile warmup) | ~18s (70% faster, no Python GC) |
 | Model support | Wide HuggingFace ecosystem | Common models with pre-built configs |
 | Quantization | GPTQ, AWQ, FP8 (native) | FP8/AutoRound on H20 best supported |
-| Tensor Parallelism | Works for all models | Works for FP16 |
-| Startup | `pip install vllm && vllm serve` | Docker pull + config dir + flags |
 
 ## Configurations
 
@@ -139,7 +142,7 @@ ssh -i <your-ssh-key> ubuntu@<IP>
 bash setup.sh --vllm
 
 # For TACO-X (image URL from your Tencent Cloud rep):
-export TACO_X_IMAGE="ccr.ccs.tencentyun.com/taco/taco_x_prod:<tag>"
+export TACO_X_IMAGE="<ask your Tencent Cloud representative for the image URL>"
 bash setup.sh --tacox
 ```
 
@@ -211,6 +214,99 @@ Qwen3-32B FP16 needs ~61 GB VRAM. A single L20 (48 GB) cannot fit it. Always use
 ```bash
 terraform destroy -var-file=configs/vllm-4xl20.tfvars
 ```
+
+## TACO-X Configuration Reference
+
+TACO-X documentation is sparse. Below is every configuration option we've found across the delivery doc, product docs, and the TACO Kit website.
+
+### CLI Arguments (`python3 -m taco_x.api_server`)
+
+| Flag | Description |
+|------|-------------|
+| `--model_dir` | Model weights directory (required) |
+| `--model_type` | Model type: `qwen3_32b`, `qwen2_5_vl_7b`, `intern2_5_vl_2b`, `qwen3_vl_8b` |
+| `--config_dir` | Directory containing scheduler, kv_cache, and lookahead config JSONs |
+| `--port` | Server port (default 18080) |
+| `--opt-level 3` | **PM confirmed**: enables (a) lookahead decoding, (b) const folding, (c) all kernel fusion, (d) best-performance kernels. Without it, TACO-X gets 230 tok/s (slower than vLLM's 348) |
+| `--tp` | Tensor parallel size (1,2,4,8). **Docs say incompatible with --opt-level, but it works in practice** |
+| `--tool-call-parser hermes` | Function calling parser |
+| `--enable-auto-tool-choice` | Enable auto mode function calling |
+| `--reasoning-parser qwen3` | Reasoning/thinking parser |
+
+### CLI Arguments (shared with TACO-LLM engine)
+
+| Flag | Description |
+|------|-------------|
+| `--max-num-batched-tokens N` | Max tokens per batch across all sequences |
+| `--max-num-seqs N` | Max concurrent sequences. Too high = slow startup + OOM. Too low = caps throughput |
+| `--enforce-eager` | Disable CUDA graphs, use eager mode |
+| `--num-scheduler-steps N` | Multi-step scheduling [1-8], overlaps CPU work onto GPU during decode |
+| `--gpu-memory-utilization F` | GPU memory fraction [0.1-0.95] for weights + activations + KV cache |
+| `--conservative-dry-run` | Extra memory safety margin for quantization scenarios |
+| `--speculative-model PATH` | Path to draft model for traditional speculative decoding |
+| `--num-speculative-tokens N` | Tokens per speculative step (e.g. 3) |
+| `--trust-remote-code` | Trust remote model code from HuggingFace |
+| `--enable-prefix-caching` | Enable automatic prefix caching (APC) |
+| `--enable-prefix-cache-offload` | Offload evicted prefix cache to CPU memory |
+| `--cpu-prefill-memory-utilization F` | CPU memory fraction for prefix cache offload (default 0.3) |
+| `--lookahead-cache-config-dir DIR` | Directory containing `lookahead_cache_config.json` |
+| `--cpu-decoding-memory-utilization F` | CPU memory fraction for lookahead cache (default 0.15) |
+| `--max-seq-len-to-capture N` | Max sequence length covered by CUDA graphs |
+| `--swap-space N` | CPU swap space in GiB per GPU |
+| `--cpu-offload-gb N` | CPU memory in GiB for weight offloading |
+| `--quantization TYPE` | Quantization: `awq`, `gptq`, `fp8` (experimental). FP8 requires Hopper GPUs (H100/H20) |
+
+### `lookahead_cache_config.json`
+
+This is TACO-X's proprietary lookahead speculative decoding config. Ships enabled by default in the container.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `cache_mode` | 2 | 0=RawLookaheadCache (N-gram/LLMA based), 1=TurboLookaheadCache (redesign, 1.4-2x higher hit rate), **2=hybrid (recommended)** |
+| `cache_size` | 5000000 | Cache size. Can also set via `--cpu-decoding-memory-utilization` |
+| `copy_length` | 7 | Lookahead window length. Reduce to 4-6 for large batch sizes (>=32) |
+| `match_length` | 2 | Min match length to trigger lookahead |
+| `turbo_match_length` | 7 | TurboLookaheadCache max match length |
+| `min_match_length` | 2 | TurboLookaheadCache min match length |
+| `cell_max_size` | 16 | Secondary cache LRU size. Range [8,32], lower = faster cache turnover |
+| `voc_size` | 200000 | Tokenizer vocab size (auto from model config) |
+| `max_seq_len` | 32768 | Max sequence length (auto from model config) |
+| `eos_token_id` | 2 | EOS token (auto from model config) |
+| `top_k` | 1 | Top-k items from secondary cache by frequency |
+| `threshold` | 2.0 | Frequency threshold for secondary cache eviction |
+| `decay` | 0.5 | Frequency decay when secondary cache is full |
+| `is_hybrid` | true | Mix multiple match-lengths for RawLookaheadCache |
+| `is_debug` | false | Enable cache hit-rate logging |
+| `log_interval` | 3000 | Log print frequency |
+| `target_parallelism` | 512 | Max sum(seq_lens) before penalizing copy_length. Only for cache_mode=0 |
+| `top_k_in_cell` | 16 | TurboLookaheadCache: tokens returned per secondary cache lookup |
+| `token_paths_top_k` | 2 | Beam search width. Try 2-4 for low hit rates |
+| `start_freq` | 10.0 | Local cache initial weight. Only when token_paths_top_k > 1 |
+| `num_threads` | 8 | TurboLookaheadCache concurrency |
+| `global_cache_switch` | true | true=cross-request global cache, false=per-request only |
+| `ignore_prompt` | false | Ignore prompt tokens (for translation / unrelated input-output scenarios) |
+| `warmup_file` | - | Path to warmup data JSON: `[{"prompt": [ids], "output": [ids]}]` |
+
+### `scheduler_config.json` / `kv_cache_config.json`
+
+Located in `--config_dir`. Key fields:
+
+| File | Field | Our Setting | Default | Notes |
+|------|-------|-------------|---------|-------|
+| scheduler | `gpu_memory_utilization` | 0.80 | 0.95 | Default OOMs on 4xL20 FP16 |
+| scheduler | `max_num_seqs` | 8 | 32 | Default OOMs on 4xL20 FP16 |
+| scheduler | `max_num_batched_tokens` | 16384 | 131072 | Default OOMs on 4xL20 FP16 |
+| kv_cache | `gpu_memory_utilization` | 0.2 | 0.95 | Must be low to avoid OOM |
+
+### Lookahead Tuning Guide (from docs)
+
+- Expected speedup with default config: **1.7x-3x+**
+- Use **greedy sampling** for best performance. If not possible, minimize temperature
+- `global_average_hit_len + 1` = effective tokens per decode iteration (ideal speedup)
+- If `global_average_hit_len < 0.8`: enable MultiPath (`token_paths_top_k: 2`), adjust `cell_max_size`
+- If hit rate OK but perf bad at large batch (>=32): reduce `copy_length` to 4-6
+- Low-compute GPUs (L20/PNV5b): batch degradation starts earlier (~bs=16)
+- Short outputs (<=32 tokens) or unrelated input/output (speech, multimodal): lookahead has limited benefit
 
 ## Disclaimers
 

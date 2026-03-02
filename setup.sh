@@ -26,7 +26,7 @@ esac
 if [ "$ENGINE" = "tacox" ] && [ -z "${TACO_X_IMAGE:-}" ]; then
     echo "ERROR: TACO_X_IMAGE is not set."
     echo "  Contact your Tencent Cloud representative for the image URL, then:"
-    echo "  export TACO_X_IMAGE=\"ccr.ccs.tencentyun.com/taco/taco_x_prod:<tag>\""
+    echo "  export TACO_X_IMAGE=\"<image URL from your Tencent Cloud rep>\""
     echo "  bash setup.sh --tacox"
     exit 1
 fi
