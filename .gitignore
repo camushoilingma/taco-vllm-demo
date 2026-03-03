@@ -22,3 +22,7 @@ __pycache__/
 # Benchmark results (local only, described in README)
 results-tp4/
 results/
+
+# Web UI (local tool, not part of the benchmark repo)
+web.py
+WEB_README.md

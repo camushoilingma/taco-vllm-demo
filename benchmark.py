@@ -867,6 +867,8 @@ async def async_main():
                         help="Requests per configuration (default: 10)")
     parser.add_argument("--warmup", type=int, default=2,
                         help="Warmup requests before timing (default: 2)")
+    parser.add_argument("--warmup-file", default=None, metavar="FILE",
+                        help="JSON file with warmup prompts to pre-populate cache before benchmark")
     parser.add_argument("--save", nargs="?", const="auto", metavar="FILE",
                         help="Save results (default: {engine}-tp{tp}-YYYYMMDD-HHMMSS.csv)")
     parser.add_argument("--launch-command", default=None,
@@ -912,6 +914,20 @@ async def async_main():
     print()
 
     client = AsyncOpenAI(base_url=args.base_url, api_key="not-needed")
+
+    # ── Warmup file: send prompts to pre-populate cache ──
+    if args.warmup_file:
+        with open(args.warmup_file) as wf:
+            warmup_prompts = json.load(wf)
+        print(f"  Sending {len(warmup_prompts)} warmup prompts from {args.warmup_file} ...")
+        for i, wp in enumerate(warmup_prompts, 1):
+            prompt = wp if isinstance(wp, str) else wp.get("prompt", "")
+            max_tok = wp.get("max_tokens", args.max_tokens) if isinstance(wp, dict) else args.max_tokens
+            r = await send_request(client, args.model, prompt, max_tok)
+            status = "OK" if r.error is None else f"FAIL: {r.error}"
+            print(f"    [{i}/{len(warmup_prompts)}] {len(prompt):.0f} chars, "
+                  f"{r.completion_tokens} tok, {r.e2e_s:.1f}s — {status}")
+        print()
 
     # ── Single-request sweep ──
     all_configs = []

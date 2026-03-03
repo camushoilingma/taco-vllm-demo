@@ -28,6 +28,7 @@ resource "tencentcloud_security_group_lite_rule" "demo" {
     "ACCEPT#${var.my_ip}#22#TCP",       # SSH
     "ACCEPT#${var.my_ip}#8000#TCP",     # vLLM API
     "ACCEPT#${var.my_ip}#18080#TCP",    # TACO-X API
+    "ACCEPT#${var.my_ip}#8080#TCP",     # Web UI
   ]
 
   egress = [

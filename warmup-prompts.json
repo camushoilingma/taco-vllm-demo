@@ -1,0 +1,12 @@
+[
+  "Explain cloud computing in simple terms. Cover what it is, why businesses use it, and give two real-world examples.",
+  "What are the main differences between TCP and UDP? Explain with examples.",
+  "Describe the key principles of microservices architecture and how it differs from monolithic applications.",
+  "What is containerization? How do Docker and Kubernetes work together?",
+  "Explain the CAP theorem in distributed systems. Give practical examples of trade-offs.",
+  "What are the benefits and drawbacks of serverless computing? When should you use it?",
+  "Compare REST APIs with GraphQL. What are the pros and cons of each approach?",
+  "Explain how load balancing works in cloud environments. What algorithms are commonly used?",
+  "What is CI/CD? Describe a typical pipeline for deploying a web application.",
+  "Explain the concept of eventual consistency in distributed databases. How does it differ from strong consistency?"
+]
