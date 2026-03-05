@@ -8,12 +8,12 @@ TACO-X is Tencent's proprietary LLM inference engine, built as a high-performanc
 
 TACO-X is distributed as a private Docker image — contact your Tencent Cloud representative for access. It exposes an OpenAI-compatible API, so benchmarks and client code work unchanged between the two engines.
 
-## Benchmark Results (2026-03-04, TP=4, vLLM v0.16.0)
+## Benchmark Results (2026-03-05, TP=4, vLLM v0.16.0)
 
 ### Summary
 
 - TACO-X achieves **~3.8x higher throughput** and **~4x lower per-token latency** than vLLM at concurrency 1
-- TTFT is **comparable** at concurrency 1 (TACO-X 40-63ms vs vLLM 39-42ms)
+- TTFT is **comparable** at concurrency 1 (TACO-X 40-63ms vs vLLM 38-42ms)
 - The advantage is almost entirely in **decode speed** — lookahead speculative decoding produces 4x faster TPOT
 - At higher concurrency (5-10), the throughput gap narrows as GPU compute saturates
 
@@ -23,49 +23,47 @@ Each engine is shown in its best configuration: **TACO-X with opt-level 3** (max
 
 | Prompt | Conc | TACO-X (opt-level 3) | vLLM (CUDA graphs) | Speedup |
 |--------|------|----------------------|---------------------|---------|
-| short  | 1    | **1,444**            | 379                 | 3.8x    |
-| short  | 5*   | **461**              | 359                 | 1.3x    |
-| short  | 10*  | **308**              | 354                 | 0.87x   |
-| medium | 1    | **1,393**            | 379                 | 3.7x    |
-| medium | 5*   | **466**              | 358                 | 1.3x    |
-| medium | 10*  | **382**              | 355                 | 1.1x    |
+| short  | 1    | **1,444**            | 377                 | 3.8x    |
+| short  | 5    | **461**              | 355                 | 1.3x    |
+| short  | 10   | 308                  | **336**              | 0.9x   |
+| medium | 1    | **1,393**            | 377                 | 3.7x    |
+| medium | 5    | **466**              | 355                 | 1.3x    |
+| medium | 10   | **382**              | 335                 | 1.1x    |
 | long   | 1    | **1,410**            | 378                 | 3.7x    |
-| long   | 5*   | **462**              | 357                 | 1.3x    |
-| long   | 10*  | **299**              | 349                 | 0.86x   |
-
-*vLLM tested at c=4 and c=8 (closest available concurrency levels)
+| long   | 5    | **462**              | 350                 | 1.3x    |
+| long   | 10   | 299                  | **328**              | 0.9x   |
 
 ### Latency — TPOT p50 (ms, lower is better)
 
 | Prompt | Conc | TACO-X (opt-level 3) | vLLM (CUDA graphs) |
 |--------|------|----------------------|---------------------|
 | short  | 1    | **6.7**              | 26.3                |
-| short  | 5*   | **20.8**             | 27.6                |
-| short  | 10*  | 34.3                 | **28.0**             |
+| short  | 5    | **20.8**             | 27.9                |
+| short  | 10   | 34.3                 | **29.4**             |
 | medium | 1    | **7.1**              | 26.3                |
-| medium | 5*   | **21.3**             | 27.7                |
-| medium | 10*  | **25.9**             | 28.1                |
+| medium | 5    | **21.3**             | 27.9                |
+| medium | 10   | **25.9**             | 29.5                |
 | long   | 1    | **6.9**              | 26.4                |
-| long   | 5*   | **21.0**             | 27.8                |
-| long   | 10*  | 34.3                 | **28.5**             |
-
-*vLLM tested at c=4 and c=8
+| long   | 5    | **21.0**             | 28.3                |
+| long   | 10   | 34.3                 | **30.1**             |
 
 ### Latency — TTFT p50 (ms, lower is better)
 
 | Prompt | Conc | TACO-X (opt-level 3) | vLLM (CUDA graphs) |
 |--------|------|----------------------|---------------------|
-| short  | 1    | 63                   | **39**               |
-| short  | 5*   | 234                  | **90**               |
-| short  | 10*  | 236                  | **121**              |
+| short  | 1    | 63                   | **38**               |
+| short  | 5    | 234                  | **95**               |
+| short  | 10   | 236                  | **124**              |
 | medium | 1    | 40                   | **38**               |
+| medium | 5    | 106                  | **83**               |
+| medium | 10   | 161                  | **122**              |
 | long   | 1    | 57                   | **42**               |
-
-*vLLM tested at c=4 and c=8
+| long   | 5    | 180                  | **94**               |
+| long   | 10   | 195                  | **145**              |
 
 ### Methodology
 
-Each engine served Qwen3-32B FP16 with TP=4 on 4x L20 48GB GPUs (PNV5b.48XLARGE768). TACO-X was tested at concurrency 1/5/10; vLLM at 1/4/8/16/32 — tables use the closest matching levels. The benchmark script (`benchmark.py`) sends 10 requests per configuration using short (~30 tok), medium (~300 tok), and long (~800 tok) prompts with max output of 256 tokens. It measures streaming throughput (tokens/s), time-to-first-token (TTFT), and time-per-output-token (TPOT) at p50/p90/p99 percentiles.
+Both engines tested at concurrency 1, 5, and 10 on identical hardware: Qwen3-32B FP16 with TP=4 on 4x L20 48GB GPUs (PNV5b.48XLARGE768). The benchmark script (`benchmark.py`) sends 10 requests per configuration using short (~30 tok), medium (~300 tok), and long (~800 tok) prompts with max output of 256 tokens. It measures streaming throughput (tokens/s), time-to-first-token (TTFT), and time-per-output-token (TPOT) at p50/p90/p99 percentiles.
 
 ### Architecture Comparison
 
@@ -255,7 +253,7 @@ TACO-X documentation is sparse. Below is every configuration option we've found 
 | `--model_type` | Model type: `qwen3_32b`, `qwen2_5_vl_7b`, `intern2_5_vl_2b`, `qwen3_vl_8b` |
 | `--config_dir` | Directory containing scheduler, kv_cache, and lookahead config JSONs |
 | `--port` | Server port (default 18080) |
-| `--opt-level 3` | Enables (a) lookahead decoding, (b) const folding, (c) all kernel fusion, (d) best-performance kernels. Without it, TACO-X gets 230 tok/s (slower than vLLM's 348) |
+| `--opt-level 3` | Enables (a) lookahead decoding, (b) const folding, (c) all kernel fusion, (d) best-performance kernels. Without it, TACO-X gets 230 tok/s (slower than vLLM's 377) |
 | `--tp` | Tensor parallel size (1,2,4,8). **Docs say incompatible with --opt-level, but it works in practice** |
 | `--tool-call-parser hermes` | Function calling parser |
 | `--enable-auto-tool-choice` | Enable auto mode function calling |
