@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Web UI for LLM inference testing — type a prompt, see streaming output
-and real-time metrics (TTFT, TPOT, throughput, token counts).
+Web UI for TACO-X vs vLLM side-by-side comparison — type a prompt,
+see both engines stream in parallel with real-time metrics.
 
 Usage:
-    python3 web.py                                          # defaults
-    python3 web.py --base-url http://1.2.3.4:18080/v1      # remote server
-    python3 web.py --port 8080                              # custom web port
+    python3 web.py                                                          # defaults
+    python3 web.py --taco-url http://localhost:18080/v1                     # TACO-X endpoint
+    python3 web.py --vllm-url http://43.153.138.241:8000/v1                # vLLM endpoint
 """
 
 import argparse
@@ -135,33 +135,49 @@ PROMPTS = {
 }
 
 app = FastAPI()
-client: AsyncOpenAI = None
-model_name: str = ""
+
+# Engine clients
+taco_client: AsyncOpenAI = None
+taco_model: str = ""
+vllm_client: AsyncOpenAI = None
+vllm_model: str = ""
 warmup_file: str = None
 
 
 @app.on_event("startup")
 async def run_warmup():
-    """Send warmup prompts on startup to populate the lookahead cache."""
-    if not warmup_file:
+    """Send warmup prompts on startup to populate the lookahead cache (TACO-X only)."""
+    all_prompts = []
+
+    if warmup_file:
+        import json as _json
+        with open(warmup_file) as f:
+            all_prompts.extend(_json.load(f))
+
+    all_prompts.extend(PROMPTS.values())
+
+    if not all_prompts:
         return
-    import json as _json
-    with open(warmup_file) as f:
-        prompts = _json.load(f)
-    print(f"  Warmup: sending {len(prompts)} prompts to populate lookahead cache...")
-    for i, p in enumerate(prompts, 1):
-        prompt = p if isinstance(p, str) else p.get("prompt", "")
-        try:
-            resp = await client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": prompt}],
-                max_tokens=256, temperature=0,
-            )
-            toks = resp.usage.completion_tokens if resp.usage else 0
-            print(f"    [{i}/{len(prompts)}] {toks} tokens")
-        except Exception as e:
-            print(f"    [{i}/{len(prompts)}] FAIL: {e}")
+
+    passes = 3
+    total = len(all_prompts) * passes
+    print(f"  Warmup (TACO-X only): {len(all_prompts)} prompts x {passes} passes = {total} requests...")
+    n = 0
+    for rnd in range(1, passes + 1):
+        for p in all_prompts:
+            n += 1
+            prompt = p if isinstance(p, str) else p.get("prompt", "")
+            try:
+                resp = await taco_client.chat.completions.create(
+                    model=taco_model,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                              {"role": "user", "content": prompt}],
+                    max_tokens=256, temperature=0,
+                )
+                toks = resp.usage.completion_tokens if resp.usage else 0
+                print(f"    [pass {rnd}, {n}/{total}] {toks} tokens")
+            except Exception as e:
+                print(f"    [pass {rnd}, {n}/{total}] FAIL: {e}")
     print("  Warmup complete.\n")
 
 
@@ -181,17 +197,24 @@ async def chat(request: Request):
     prompt = body.get("prompt", "")
     max_tokens = body.get("max_tokens", 256)
     temperature = body.get("temperature", 0.0)
+    engine = body.get("engine", "taco")
+
+    if engine == "vllm":
+        api_client = vllm_client
+        api_model = vllm_model
+    else:
+        api_client = taco_client
+        api_model = taco_model
 
     async def event_stream():
         t_start = time.perf_counter()
         ttft_ms = None
         completion_tokens = 0
         prompt_tokens = 0
-        chunk_count = 0
 
         try:
-            stream = await client.chat.completions.create(
-                model=model_name,
+            stream = await api_client.chat.completions.create(
+                model=api_model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -218,12 +241,10 @@ async def chat(request: Request):
 
                 delta = chunk.choices[0].delta.content
                 if delta:
-                    chunk_count += 1
                     yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
 
             e2e_s = time.perf_counter() - t_start
 
-            # TPOT = (E2E - TTFT) / (completion_tokens - 1)
             tpot_avg = None
             if completion_tokens > 1 and ttft_ms is not None:
                 tpot_avg = ((e2e_s * 1000) - ttft_ms) / (completion_tokens - 1)
@@ -233,7 +254,7 @@ async def chat(request: Request):
             metrics = {
                 "type": "metrics",
                 "ttft_ms": round(ttft_ms, 1) if ttft_ms else None,
-                "tpot_p50_ms": round(tpot_avg, 1) if tpot_avg else None,
+                "tpot_ms": round(tpot_avg, 1) if tpot_avg else None,
                 "e2e_s": round(e2e_s, 3),
                 "tok_s": round(tok_s, 1),
                 "prompt_tokens": prompt_tokens,
@@ -249,13 +270,12 @@ async def chat(request: Request):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LLM Inference Tester</title>
+<title>TACO-X vs vLLM</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -269,6 +289,8 @@ HTML_PAGE = """<!DOCTYPE html>
     --green: #3fb950;
     --yellow: #d29922;
     --red: #f85149;
+    --taco-accent: #f0883e;
+    --vllm-accent: #58a6ff;
     --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
   }
@@ -301,47 +323,17 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--text);
   }
 
+  header h1 .taco { color: var(--taco-accent); }
+  header h1 .vllm { color: var(--vllm-accent); }
+
   header .server-info {
     font-size: 12px;
     color: var(--text-dim);
     font-family: var(--font-mono);
   }
 
-  .main {
-    display: flex;
-    flex: 1;
-    overflow: hidden;
-  }
-
-  .left-pane, .right-pane {
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .left-pane {
-    flex: 1;
-    border-right: 1px solid var(--border);
-    min-width: 0;
-  }
-
-  .right-pane {
-    width: 420px;
-    flex-shrink: 0;
-  }
-
-  .pane-header {
-    background: var(--surface);
-    padding: 10px 16px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-dim);
+  .input-section {
     border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
     flex-shrink: 0;
   }
 
@@ -351,7 +343,6 @@ HTML_PAGE = """<!DOCTYPE html>
     padding: 10px 16px;
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
   }
 
   .preset-btn {
@@ -378,13 +369,6 @@ HTML_PAGE = """<!DOCTYPE html>
     background: rgba(88, 166, 255, 0.12);
   }
 
-  .input-area {
-    display: flex;
-    flex-direction: column;
-    flex-shrink: 0;
-    border-bottom: 1px solid var(--border);
-  }
-
   .prompt-box {
     padding: 12px 16px;
     background: var(--bg);
@@ -392,8 +376,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
   textarea {
     width: 100%;
-    min-height: 80px;
-    max-height: 200px;
+    min-height: 60px;
+    max-height: 150px;
     padding: 10px 12px;
     background: var(--surface2);
     border: 1px solid var(--border);
@@ -407,13 +391,8 @@ HTML_PAGE = """<!DOCTYPE html>
     transition: border-color 0.15s;
   }
 
-  textarea:focus {
-    border-color: var(--accent);
-  }
-
-  textarea::placeholder {
-    color: var(--text-dim);
-  }
+  textarea:focus { border-color: var(--accent); }
+  textarea::placeholder { color: var(--text-dim); }
 
   .controls {
     display: flex;
@@ -443,13 +422,11 @@ HTML_PAGE = """<!DOCTYPE html>
     outline: none;
   }
 
-  .param input:focus {
-    border-color: var(--accent);
-  }
+  .param input:focus { border-color: var(--accent); }
 
   .send-btn {
     margin-left: auto;
-    padding: 7px 20px;
+    padding: 7px 24px;
     background: var(--accent);
     color: #fff;
     border: none;
@@ -461,20 +438,77 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   .send-btn:hover { background: var(--accent-hover); }
+  .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .send-btn.stop { background: var(--red); }
 
-  .send-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  /* Two-column comparison area */
+  .compare-area {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
   }
 
-  .send-btn.stop {
-    background: var(--red);
+  .engine-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .engine-col:first-child {
+    border-right: 1px solid var(--border);
+  }
+
+  .engine-header {
+    background: var(--surface);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  .engine-header .engine-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .engine-header .taco-label { color: var(--taco-accent); }
+  .engine-header .vllm-label { color: var(--vllm-accent); }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    display: inline-block;
+  }
+
+  .status-dot.streaming { background: var(--green); animation: pulse 1.5s ease infinite; }
+  .status-dot.done { background: var(--green); }
+  .status-dot.error { background: var(--red); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .engine-header .status-text {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
   }
 
   .output-area {
     flex: 1;
     overflow-y: auto;
-    padding: 16px;
+    padding: 14px 16px;
     font-family: var(--font-mono);
     font-size: 13px;
     line-height: 1.7;
@@ -483,18 +517,7 @@ HTML_PAGE = """<!DOCTYPE html>
     background: var(--bg);
   }
 
-  .output-area .token {
-    color: var(--text);
-  }
-
-  .output-area .log {
-    color: var(--text-dim);
-    font-size: 12px;
-  }
-
-  .output-area .error {
-    color: var(--red);
-  }
+  .output-area .error { color: var(--red); }
 
   .cursor-blink {
     display: inline-block;
@@ -510,109 +533,45 @@ HTML_PAGE = """<!DOCTYPE html>
     50% { opacity: 0; }
   }
 
-  .metrics-panel {
-    overflow-y: auto;
-    padding: 16px;
-  }
-
-  .metric-card {
+  .metrics-bar {
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 16px;
-    margin-bottom: 12px;
+    border-top: 1px solid var(--border);
+    padding: 10px 16px;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    flex-shrink: 0;
   }
 
-  .metric-card h3 {
-    font-size: 11px;
+  .metric-item {
+    text-align: center;
+  }
+
+  .metric-item .label {
+    font-size: 10px;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.05em;
     color: var(--text-dim);
-    margin-bottom: 10px;
+    margin-bottom: 2px;
   }
 
-  .metric-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    padding: 5px 0;
-  }
-
-  .metric-label {
-    font-size: 13px;
-    color: var(--text-dim);
-  }
-
-  .metric-value {
-    font-size: 18px;
+  .metric-item .value {
+    font-size: 16px;
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--text);
   }
 
-  .metric-value.highlight {
-    color: var(--green);
-  }
+  .metric-item .value.highlight { color: var(--green); }
 
-  .metric-unit {
-    font-size: 12px;
+  .metric-item .unit {
+    font-size: 10px;
     color: var(--text-dim);
     font-weight: 400;
-    margin-left: 3px;
   }
 
-  .history-list {
-    padding: 0 16px 16px;
-  }
-
-  .history-item {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin-bottom: 8px;
-    cursor: pointer;
-    transition: border-color 0.15s;
-  }
-
-  .history-item:hover {
-    border-color: var(--accent);
-  }
-
-  .history-meta {
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
-    color: var(--text-dim);
-    font-family: var(--font-mono);
-    margin-bottom: 4px;
-  }
-
-  .history-prompt {
-    font-size: 12px;
-    color: var(--text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--text-dim);
-    display: inline-block;
-    margin-right: 6px;
-  }
-
-  .status-dot.streaming { background: var(--green); animation: pulse 1.5s ease infinite; }
-  .status-dot.done { background: var(--green); }
-  .status-dot.error { background: var(--red); }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
+  .metric-item .value.winner { color: var(--green); }
+  .metric-item .value.loser { color: var(--text-dim); }
 
   .empty-state {
     display: flex;
@@ -635,106 +594,94 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 
 <header>
-  <h1>LLM Inference Tester</h1>
-  <span class="server-info" id="serverInfo"></span>
+  <h1><span class="taco">TACO-X</span> vs <span class="vllm">vLLM</span> &mdash; Side-by-Side Comparison</h1>
+  <span class="server-info">Qwen3-32B FP16 &middot; 4x L20</span>
 </header>
 
-<div class="main">
-  <div class="left-pane">
-    <div class="input-area">
-      <div class="preset-buttons">
-        <button class="preset-btn" onclick="loadPreset('short')">Short (~35 tok)</button>
-        <button class="preset-btn" onclick="loadPreset('medium')">Medium (~290 tok)</button>
-        <button class="preset-btn" onclick="loadPreset('long')">Long (~1000 tok)</button>
-        <button class="preset-btn" onclick="clearPrompt()" style="margin-left:auto; color:var(--text-dim);">Clear</button>
-      </div>
-      <div class="prompt-box">
-        <textarea id="promptInput" placeholder="Type your prompt here, or click a preset above..." rows="3"></textarea>
-      </div>
-      <div class="controls">
-        <div class="param">
-          <label>Max tokens</label>
-          <input type="number" id="maxTokens" value="2048" min="1" max="32768">
-        </div>
-        <div class="param">
-          <label>Temp</label>
-          <input type="number" id="temperature" value="0" min="0" max="2" step="0.1">
-        </div>
-        <button class="send-btn" id="sendBtn" onclick="sendPrompt()">Send</button>
-      </div>
+<div class="input-section">
+  <div class="preset-buttons">
+    <button class="preset-btn" onclick="loadPreset('short')">Short (~35 tok)</button>
+    <button class="preset-btn" onclick="loadPreset('medium')">Medium (~290 tok)</button>
+    <button class="preset-btn" onclick="loadPreset('long')">Long (~1000 tok)</button>
+    <button class="preset-btn" onclick="clearPrompt()" style="margin-left:auto; color:var(--text-dim);">Clear</button>
+  </div>
+  <div class="prompt-box">
+    <textarea id="promptInput" placeholder="Type your prompt here, or click a preset above..." rows="2"></textarea>
+  </div>
+  <div class="controls">
+    <div class="param">
+      <label>Max tokens</label>
+      <input type="number" id="maxTokens" value="256" min="1" max="4096">
     </div>
+    <div class="param">
+      <label>Temp</label>
+      <input type="number" id="temperature" value="0" min="0" max="2" step="0.1">
+    </div>
+    <button class="send-btn" id="sendBtn" onclick="sendPrompt()">Send</button>
+  </div>
+</div>
 
-    <div class="pane-header">
-      <span><span class="status-dot" id="statusDot"></span><span id="statusText">Ready</span></span>
-      <span id="tokenCounter" style="font-family:var(--font-mono); font-weight:400;"></span>
+<div class="compare-area">
+  <!-- TACO-X Column -->
+  <div class="engine-col" id="tacoCol">
+    <div class="engine-header">
+      <div class="engine-name">
+        <span class="status-dot" id="tacoDot"></span>
+        <span class="taco-label">TACO-X</span>
+        <span style="font-size:11px; font-weight:400; color:var(--text-dim);">(opt-level 3)</span>
+      </div>
+      <span class="status-text" id="tacoStatus">Ready</span>
     </div>
-    <div class="output-area" id="outputArea">
+    <div class="output-area" id="tacoOutput">
       <div class="empty-state">
         <div class="icon">&#9655;</div>
-        <div>Send a prompt to see streaming output</div>
+        <div>Send a prompt to compare engines</div>
       </div>
+    </div>
+    <div class="metrics-bar" id="tacoMetrics">
+      <div class="metric-item"><div class="label">TTFT</div><div class="value" id="tacoTTFT">--<span class="unit">ms</span></div></div>
+      <div class="metric-item"><div class="label">TPOT</div><div class="value" id="tacoTPOT">--<span class="unit">ms</span></div></div>
+      <div class="metric-item"><div class="label">E2E</div><div class="value" id="tacoE2E">--<span class="unit">s</span></div></div>
+      <div class="metric-item"><div class="label">Tok/s</div><div class="value highlight" id="tacoTokS">--</div></div>
+      <div class="metric-item"><div class="label">Tokens</div><div class="value" id="tacoTokens">--</div></div>
     </div>
   </div>
 
-  <div class="right-pane">
-    <div class="pane-header">Metrics</div>
-    <div class="metrics-panel" id="metricsPanel">
-      <div class="metric-card">
-        <h3>Latency</h3>
-        <div class="metric-row">
-          <span class="metric-label">Time to First Token</span>
-          <span class="metric-value" id="mTTFT">--<span class="metric-unit">ms</span></span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">TPOT (p50)</span>
-          <span class="metric-value" id="mTPOT">--<span class="metric-unit">ms</span></span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">End-to-End</span>
-          <span class="metric-value" id="mE2E">--<span class="metric-unit">s</span></span>
-        </div>
+  <!-- vLLM Column -->
+  <div class="engine-col" id="vllmCol">
+    <div class="engine-header">
+      <div class="engine-name">
+        <span class="status-dot" id="vllmDot"></span>
+        <span class="vllm-label">vLLM</span>
+        <span style="font-size:11px; font-weight:400; color:var(--text-dim);">(CUDA graphs)</span>
       </div>
-
-      <div class="metric-card">
-        <h3>Throughput</h3>
-        <div class="metric-row">
-          <span class="metric-label">Generation Speed</span>
-          <span class="metric-value highlight" id="mTokS">--<span class="metric-unit">tok/s</span></span>
-        </div>
-      </div>
-
-      <div class="metric-card">
-        <h3>Tokens</h3>
-        <div class="metric-row">
-          <span class="metric-label">Prompt</span>
-          <span class="metric-value" id="mPromptTok">--</span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-label">Completion</span>
-          <span class="metric-value" id="mCompTok">--</span>
-        </div>
+      <span class="status-text" id="vllmStatus">Ready</span>
+    </div>
+    <div class="output-area" id="vllmOutput">
+      <div class="empty-state">
+        <div class="icon">&#9655;</div>
+        <div>Send a prompt to compare engines</div>
       </div>
     </div>
-
-    <div class="pane-header">History</div>
-    <div class="history-list" id="historyList" style="flex:1; overflow-y:auto;"></div>
+    <div class="metrics-bar" id="vllmMetrics">
+      <div class="metric-item"><div class="label">TTFT</div><div class="value" id="vllmTTFT">--<span class="unit">ms</span></div></div>
+      <div class="metric-item"><div class="label">TPOT</div><div class="value" id="vllmTPOT">--<span class="unit">ms</span></div></div>
+      <div class="metric-item"><div class="label">E2E</div><div class="value" id="vllmE2E">--<span class="unit">s</span></div></div>
+      <div class="metric-item"><div class="label">Tok/s</div><div class="value highlight" id="vllmTokS">--</div></div>
+      <div class="metric-item"><div class="label">Tokens</div><div class="value" id="vllmTokens">--</div></div>
+    </div>
   </div>
 </div>
 
 <script>
 const presets = {};
 let streaming = false;
-let abortController = null;
-let history = [];
+let abortControllers = [];
 
 async function init() {
   const resp = await fetch('/api/presets');
   const data = await resp.json();
   Object.assign(presets, data);
-
-  const params = new URLSearchParams(window.location.search);
-  document.getElementById('serverInfo').textContent =
-    params.get('server') || window.location.host;
 }
 
 function loadPreset(name) {
@@ -750,77 +697,94 @@ function clearPrompt() {
   document.getElementById('promptInput').focus();
 }
 
-function resetMetrics() {
-  ['mTTFT','mTPOT','mE2E','mTokS','mPromptTok','mCompTok'].forEach(id => {
-    const el = document.getElementById(id);
-    const unit = el.querySelector('.metric-unit');
-    el.textContent = '--';
-    if (unit) el.appendChild(unit);
-  });
-}
-
 function setMetric(id, value) {
   const el = document.getElementById(id);
-  const unit = el.querySelector('.metric-unit');
+  const unit = el.querySelector('.unit');
   el.textContent = value;
   if (unit) el.appendChild(unit);
 }
 
-function setStatus(state, text) {
-  const dot = document.getElementById('statusDot');
+function setStatus(engine, state, text) {
+  const dot = document.getElementById(engine + 'Dot');
   dot.className = 'status-dot ' + state;
-  document.getElementById('statusText').textContent = text;
+  document.getElementById(engine + 'Status').textContent = text;
 }
 
-async function sendPrompt() {
-  const prompt = document.getElementById('promptInput').value.trim();
-  if (!prompt) return;
+function resetEngine(engine) {
+  ['TTFT','TPOT','E2E','TokS','Tokens'].forEach(m => {
+    setMetric(engine + m, '--');
+  });
+  setStatus(engine, '', 'Ready');
+}
 
-  if (streaming) {
-    if (abortController) abortController.abort();
-    return;
+// Compare metrics and highlight winners after both complete
+let engineMetrics = { taco: null, vllm: null };
+
+function highlightWinners() {
+  const t = engineMetrics.taco;
+  const v = engineMetrics.vllm;
+  if (!t || !v) return;
+
+  // Lower is better: TTFT, TPOT, E2E
+  [['TTFT', 'ttft_ms'], ['TPOT', 'tpot_ms'], ['E2E', 'e2e_s']].forEach(([label, key]) => {
+    const tacoEl = document.getElementById('taco' + label);
+    const vllmEl = document.getElementById('vllm' + label);
+    tacoEl.classList.remove('winner', 'loser');
+    vllmEl.classList.remove('winner', 'loser');
+    if (t[key] != null && v[key] != null) {
+      if (t[key] < v[key]) {
+        tacoEl.classList.add('winner');
+        vllmEl.classList.add('loser');
+      } else if (v[key] < t[key]) {
+        vllmEl.classList.add('winner');
+        tacoEl.classList.add('loser');
+      }
+    }
+  });
+
+  // Higher is better: tok/s
+  const tacoTokEl = document.getElementById('tacoTokS');
+  const vllmTokEl = document.getElementById('vllmTokS');
+  tacoTokEl.classList.remove('winner', 'loser');
+  vllmTokEl.classList.remove('winner', 'loser');
+  if (t.tok_s > v.tok_s) {
+    tacoTokEl.classList.add('winner');
+    vllmTokEl.classList.add('loser');
+  } else if (v.tok_s > t.tok_s) {
+    vllmTokEl.classList.add('winner');
+    tacoTokEl.classList.add('loser');
   }
+}
 
-  const maxTokens = parseInt(document.getElementById('maxTokens').value) || 256;
-  const temperature = parseFloat(document.getElementById('temperature').value) || 0;
-
-  streaming = true;
-  const btn = document.getElementById('sendBtn');
-  btn.textContent = 'Stop';
-  btn.classList.add('stop');
-
-  resetMetrics();
-  setStatus('streaming', 'Streaming...');
-
-  const output = document.getElementById('outputArea');
+async function streamEngine(engine, prompt, maxTokens, temperature) {
+  const output = document.getElementById(engine + 'Output');
   output.innerHTML = '';
-  const counter = document.getElementById('tokenCounter');
-  let tokenCount = 0;
+  setStatus(engine, 'streaming', 'Streaming...');
 
-  abortController = new AbortController();
-  const startTime = performance.now();
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor-blink';
+
+  const ac = new AbortController();
+  abortControllers.push(ac);
 
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ prompt, max_tokens: maxTokens, temperature }),
-      signal: abortController.signal,
+      body: JSON.stringify({ prompt, max_tokens: maxTokens, temperature, engine }),
+      signal: ac.signal,
     });
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
-    const cursor = document.createElement('span');
-    cursor.className = 'cursor-blink';
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\\n');
+      const lines = buffer.split('\n');
       buffer = lines.pop();
 
       for (const line of lines) {
@@ -833,77 +797,75 @@ async function sendPrompt() {
 
           if (msg.type === 'token') {
             cursor.remove();
-            const span = document.createTextNode(msg.content);
-            output.appendChild(span);
+            output.appendChild(document.createTextNode(msg.content));
             output.appendChild(cursor);
             output.scrollTop = output.scrollHeight;
-            tokenCount++;
-            counter.textContent = tokenCount + ' tokens';
           }
 
           if (msg.type === 'metrics') {
             cursor.remove();
-            if (msg.ttft_ms != null) setMetric('mTTFT', msg.ttft_ms);
-            if (msg.tpot_p50_ms != null) setMetric('mTPOT', msg.tpot_p50_ms);
-            setMetric('mE2E', msg.e2e_s);
-            setMetric('mTokS', msg.tok_s);
-            setMetric('mPromptTok', msg.prompt_tokens);
-            setMetric('mCompTok', msg.completion_tokens);
-            setStatus('done', 'Complete — ' + msg.e2e_s + 's');
+            if (msg.ttft_ms != null) setMetric(engine + 'TTFT', msg.ttft_ms);
+            if (msg.tpot_ms != null) setMetric(engine + 'TPOT', msg.tpot_ms);
+            setMetric(engine + 'E2E', msg.e2e_s);
+            setMetric(engine + 'TokS', msg.tok_s);
+            setMetric(engine + 'Tokens', msg.prompt_tokens + ' > ' + msg.completion_tokens);
+            setStatus(engine, 'done', 'Done ' + msg.e2e_s + 's');
 
-            history.unshift({
-              prompt: prompt.substring(0, 80),
-              tok_s: msg.tok_s,
-              ttft: msg.ttft_ms,
-              e2e: msg.e2e_s,
-              time: new Date().toLocaleTimeString(),
-            });
-            renderHistory();
+            engineMetrics[engine] = msg;
+            highlightWinners();
           }
 
           if (msg.type === 'error') {
-            output.innerHTML += '<span class="error">\\nError: ' + msg.content + '</span>';
-            setStatus('error', 'Error');
+            cursor.remove();
+            output.innerHTML += '<span class="error">\nError: ' + msg.content + '</span>';
+            setStatus(engine, 'error', 'Error');
           }
         } catch(e) {}
       }
     }
   } catch (e) {
     if (e.name === 'AbortError') {
-      setStatus('done', 'Stopped');
+      setStatus(engine, 'done', 'Stopped');
     } else {
-      setStatus('error', 'Connection error');
-      output.innerHTML += '<span class="error">\\n' + e.message + '</span>';
+      setStatus(engine, 'error', 'Connection error');
+      output.innerHTML += '<span class="error">\n' + e.message + '</span>';
     }
   }
+}
+
+async function sendPrompt() {
+  const prompt = document.getElementById('promptInput').value.trim();
+  if (!prompt) return;
+
+  if (streaming) {
+    abortControllers.forEach(ac => ac.abort());
+    return;
+  }
+
+  const maxTokens = parseInt(document.getElementById('maxTokens').value) || 256;
+  const temperature = parseFloat(document.getElementById('temperature').value) || 0;
+
+  streaming = true;
+  abortControllers = [];
+  engineMetrics = { taco: null, vllm: null };
+
+  const btn = document.getElementById('sendBtn');
+  btn.textContent = 'Stop';
+  btn.classList.add('stop');
+
+  resetEngine('taco');
+  resetEngine('vllm');
+
+  // Fire both engines in parallel
+  await Promise.allSettled([
+    streamEngine('taco', prompt, maxTokens, temperature),
+    streamEngine('vllm', prompt, maxTokens, temperature),
+  ]);
 
   streaming = false;
-  abortController = null;
+  abortControllers = [];
   btn.textContent = 'Send';
   btn.classList.remove('stop');
-}
-
-function renderHistory() {
-  const list = document.getElementById('historyList');
-  list.innerHTML = history.map((h, i) => `
-    <div class="history-item" onclick="showHistoryItem(${i})">
-      <div class="history-meta">
-        <span>${h.tok_s} tok/s &middot; TTFT ${h.ttft || '--'}ms</span>
-        <span>${h.time}</span>
-      </div>
-      <div class="history-prompt">${escapeHtml(h.prompt)}</div>
-    </div>
-  `).join('');
-}
-
-function showHistoryItem(i) {
-  // placeholder for future replay
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
 }
 
 document.getElementById('promptInput').addEventListener('keydown', function(e) {
@@ -922,30 +884,43 @@ init();
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM Inference Web Tester")
-    parser.add_argument("--base-url", default="http://localhost:18080/v1",
-                        help="LLM server URL (default: http://localhost:18080/v1)")
-    parser.add_argument("--model", default="Qwen/Qwen3-32B",
-                        help="Model name")
+    parser = argparse.ArgumentParser(description="TACO-X vs vLLM Side-by-Side Comparison")
+    parser.add_argument("--taco-url", default="http://localhost:18080/v1",
+                        help="TACO-X server URL (default: http://localhost:18080/v1)")
+    parser.add_argument("--taco-model", default="Qwen/Qwen3-32B",
+                        help="TACO-X model name")
+    parser.add_argument("--vllm-url", default="http://43.153.138.241:8000/v1",
+                        help="vLLM server URL")
+    parser.add_argument("--vllm-model", default="Qwen/Qwen3-32B",
+                        help="vLLM model name")
     parser.add_argument("--port", type=int, default=8080,
                         help="Web UI port (default: 8080)")
     parser.add_argument("--host", default="0.0.0.0",
                         help="Web UI host (default: 0.0.0.0)")
     parser.add_argument("--warmup-file", default=None, metavar="FILE",
-                        help="JSON file with warmup prompts to populate lookahead cache on startup")
+                        help="JSON file with warmup prompts for TACO-X lookahead cache")
+    # Keep --base-url and --model for backwards compat
+    parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--model", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    global client, model_name, warmup_file
-    client = AsyncOpenAI(base_url=args.base_url, api_key="not-needed")
-    model_name = args.model
+    global taco_client, taco_model, vllm_client, vllm_model, warmup_file
+
+    # Backwards compat: --base-url maps to --taco-url
+    taco_url = args.base_url or args.taco_url
+    taco_model = args.model or args.taco_model
+
+    taco_client = AsyncOpenAI(base_url=taco_url, api_key="not-needed")
+    vllm_client = AsyncOpenAI(base_url=args.vllm_url, api_key="not-needed")
+    vllm_model = args.vllm_model
     warmup_file = args.warmup_file
 
-    print(f"LLM Inference Tester")
-    print(f"  Web UI:  http://localhost:{args.port}")
-    print(f"  Server:  {args.base_url}")
-    print(f"  Model:   {args.model}")
+    print(f"TACO-X vs vLLM Comparison")
+    print(f"  Web UI:    http://localhost:{args.port}")
+    print(f"  TACO-X:    {taco_url} ({taco_model})")
+    print(f"  vLLM:      {args.vllm_url} ({vllm_model})")
     if warmup_file:
-        print(f"  Warmup:  {warmup_file}")
+        print(f"  Warmup:    {warmup_file}")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

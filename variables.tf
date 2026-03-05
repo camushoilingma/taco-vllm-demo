@@ -71,17 +71,13 @@ variable "bandwidth" {
 
 variable "key_id" {
   type    = string
-  default = "skey-xxxxxxxx"
+  default = "skey-1x6dw3nj"
 }
 
-variable "my_ip" {
-  description = "Your public IP in CIDR (e.g. 81.249.144.139/32)"
+variable "security_group_id" {
+  description = "Existing security group ID to attach"
   type        = string
-}
-
-variable "security_group_name" {
-  type    = string
-  default = "taco-benchmark-sg"
+  default     = "sg-glu6qmn6"
 }
 
 ## ── Tags ──

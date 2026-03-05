@@ -14,28 +14,6 @@ provider "tencentcloud" {
   secret_key = var.secret_key
 }
 
-# ── Security Group ──
-
-resource "tencentcloud_security_group" "demo" {
-  name        = var.security_group_name
-  description = "Security group for TACO/vLLM benchmark instance"
-}
-
-resource "tencentcloud_security_group_lite_rule" "demo" {
-  security_group_id = tencentcloud_security_group.demo.id
-
-  ingress = [
-    "ACCEPT#${var.my_ip}#22#TCP",       # SSH
-    "ACCEPT#${var.my_ip}#8000#TCP",     # vLLM API
-    "ACCEPT#${var.my_ip}#18080#TCP",    # TACO-X API
-    "ACCEPT#${var.my_ip}#8080#TCP",     # Web UI
-  ]
-
-  egress = [
-    "ACCEPT#0.0.0.0/0#ALL#ALL",
-  ]
-}
-
 # ── GPU Instance ──
 
 resource "tencentcloud_instance" "gpu" {
@@ -51,7 +29,7 @@ resource "tencentcloud_instance" "gpu" {
   internet_max_bandwidth_out = var.bandwidth
   internet_charge_type       = "TRAFFIC_POSTPAID_BY_HOUR"
 
-  orderly_security_groups    = [tencentcloud_security_group.demo.id]
+  orderly_security_groups    = [var.security_group_id]
 
   key_ids                    = [var.key_id]
 

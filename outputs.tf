@@ -15,5 +15,5 @@ output "ssh_command" {
 
 output "security_group_id" {
   description = "Security group ID"
-  value       = tencentcloud_security_group.demo.id
+  value       = var.security_group_id
 }
